@@ -1,0 +1,260 @@
+import { prismaWrite, prismaRead } from '../../lib/prisma';
+import { hashPassword, verifyPassword, sha256, hashFingerprint } from '../../utils/hash';
+import { signTokenPair, signLoginPendingToken } from '../../utils/jwt';
+import { generateAccountNumber } from '../../utils/accountNumber';
+import { createOtp } from '../../utils/otp';
+import { sendMail, otpEmailHtml, newDeviceAlertHtml } from '../../lib/mailer';
+import { publishEvent } from '../../lib/kafka';
+import { config } from '../../config/env';
+import { LiveRegisterInput, LiveLoginInput } from './live.schema';
+import { AppError } from '../../utils/errors';
+import { logger } from '../../lib/logger';
+
+/**
+ * Fire-and-forget email helper — SMTP failures are logged but never thrown.
+ * The caller's happy path must never depend on email delivery succeeding.
+ */
+function fireEmail(task: Promise<void>, context: Record<string, unknown>): void {
+  task.catch((err: unknown) => {
+    logger.error({ err, ...context }, '[mailer] Email delivery failed — non-fatal');
+  });
+}
+
+// ── Register ──────────────────────────────────────────────────────────────────
+
+export async function registerLiveUser(input: LiveRegisterInput) {
+  // Account number from Redis atomic counter
+  const accountNumber = await generateAccountNumber('LU');
+  const passwordHash = await hashPassword(input.password);
+
+  // ── Phone pre-flight check ──────────────────────────────────────────────────
+  // Check before publishing to Kafka so the user gets an immediate 409 instead of
+  // a silent drop by the Kafka consumer. If user-service is unreachable, skip the
+  // check (fail-open) and let the consumer handle it.
+  try {
+    const phoneResp = await fetch(
+      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-phone/${encodeURIComponent(input.phoneNumber)}?ownerEmail=${encodeURIComponent(input.email)}`,
+      { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+    );
+    if (phoneResp.ok) {
+      const { available } = await phoneResp.json() as { available: boolean };
+      if (!available) {
+        throw new AppError('PHONE_ALREADY_REGISTERED', 409, 'This phone number is already registered to another account.');
+      }
+    }
+  } catch (err) {
+    // Re-throw AppError (phone conflict) — only swallow network errors
+    if (err instanceof AppError) throw err;
+    logger.warn({ err }, '[register] Phone pre-flight check failed — proceeding without check');
+  }
+
+  // Publish to Kafka → user-service will create the actual user row
+  await publishEvent('user.register', accountNumber, {
+    type: 'LIVE_USER_REGISTER',
+    accountNumber,
+    passwordHash,
+    email: input.email,
+    phoneNumber: input.phoneNumber,
+    country: input.country,
+    groupName: input.groupName,
+    currency: 'USD',
+    leverage: 100,
+    isSelfTrading: true,
+  });
+
+  // OTP keyed by accountNumber (NOT email) — this supports multiple accounts
+  // per email. The frontend receives accountNumber and passes it to /verify-email.
+  const otp = await createOtp(accountNumber, 'email_verify');
+  fireEmail(
+    sendMail({
+      to: input.email,
+      subject: 'Verify your LiveFXHub account',
+      html: otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
+    }),
+    { email: input.email, accountNumber, purpose: 'email_verify' },
+  );
+
+  return { accountNumber, message: 'Account created. Please verify your email.' };
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+
+interface LoginContext {
+  userId: string;
+  userType: 'live';
+  accountNumber: string;
+  groupName: string;
+  currency: string;
+  passwordHash: string;
+  isActive: boolean;
+}
+
+/**
+ * Fetches live user context from user-service via internal HTTP call.
+ * In dev, we can also pass a resolved context directly.
+ */
+async function getLiveUserContext(email: string): Promise<LoginContext | null> {
+  try {
+    const resp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-service-secret': config.internalSecret,
+      },
+      body: JSON.stringify({ email, userType: 'live' }),
+    });
+    if (!resp.ok) return null;
+    return (await resp.json()) as LoginContext;
+  } catch {
+    return null;
+  }
+}
+
+export async function loginLiveUser(
+  input: LiveLoginInput,
+  ipAddress: string,
+  userAgent: string,
+) {
+  // Fetch user from user-service
+  const ctx = await getLiveUserContext(input.email);
+  if (!ctx) throw new AppError('INVALID_CREDENTIALS', 401);
+  if (!ctx.isActive) throw new AppError('ACCOUNT_INACTIVE', 403);
+
+  // Verify password
+  const passwordOk = await verifyPassword(input.password, ctx.passwordHash);
+  if (!passwordOk) throw new AppError('INVALID_CREDENTIALS', 401);
+
+  const fingerprintHash = input.deviceFingerprint
+    ? hashFingerprint(input.deviceFingerprint)
+    : null;
+
+  // ── Device check ──────────────────────────────────────────────────────────
+  let requires2FA = false;
+  let isNewDevice = false;
+
+  if (fingerprintHash) {
+    const knownDevice = await prismaRead.knownDevice.findUnique({
+      where: { userId_userType_fingerprintHash: {
+        userId: ctx.userId,
+        userType: 'live',
+        fingerprintHash,
+      }},
+    });
+
+    if (!knownDevice) {
+      // Brand new device
+      isNewDevice = true;
+      requires2FA = true;
+    } else {
+      // Known device — check inactivity
+      const daysSinceLastSeen = (Date.now() - knownDevice.lastSeenAt.getTime()) / 86_400_000;
+      if (daysSinceLastSeen > config.inactivity2faDays) {
+        requires2FA = true;
+      }
+    }
+  }
+
+  // ── If 2FA required, return login_pending token ───────────────────────────
+  if (requires2FA) {
+    // Check if user has TOTP set up
+    const totpRecord = await prismaRead.userTotpSecret.findUnique({
+      where: { userId_userType: { userId: ctx.userId, userType: 'live' } },
+    });
+    const hasTOTP = totpRecord?.isVerified ?? false;
+
+    const loginToken = signLoginPendingToken(ctx.userId, 'live');
+
+    if (!hasTOTP) {
+      // Generate + store OTP in Redis, then fire email non-fatally.
+      // The loginToken is returned regardless of email delivery outcome.
+      const otp = await createOtp(ctx.userId, 'login');
+      fireEmail(
+        sendMail({
+          to: input.email,
+          subject: 'Your LiveFXHub login code',
+          html: otpEmailHtml(otp, 'login verification', config.otpExpiresInMinutes),
+        }),
+        { userId: ctx.userId, purpose: 'login' },
+      );
+    }
+
+    // New device — send alert email async (non-blocking)
+    if (isNewDevice && config.newDeviceAlert) {
+      sendMail({
+        to: input.email,
+        subject: '⚠️ New device login detected — LiveFXHub',
+        html: newDeviceAlertHtml(
+          input.deviceLabel ?? userAgent,
+          ipAddress,
+          new Date().toISOString(),
+        ),
+      }).catch(() => void 0);
+    }
+
+    return {
+      status: hasTOTP ? 'totp_required' : 'otp_required',
+      loginToken,
+      message: hasTOTP
+        ? 'Enter your authenticator code to continue'
+        : 'A verification code has been sent to your email',
+    };
+  }
+
+  // ── Issue tokens directly ─────────────────────────────────────────────────
+  return await issueTokensAndCreateSession(ctx, fingerprintHash, input.deviceLabel ?? null, ipAddress, userAgent, isNewDevice);
+}
+
+export async function issueTokensAndCreateSession(
+  ctx: LoginContext,
+  fingerprintHash: string | null,
+  deviceLabel: string | null,
+  ipAddress: string,
+  userAgent: string,
+  isNewDevice: boolean,
+) {
+  const tokens = signTokenPair(ctx.userId, ctx.userType, ctx.accountNumber, {
+    groupName: ctx.groupName,
+    currency: ctx.currency,
+  });
+
+  // Create session row
+  await prismaWrite.session.create({
+    data: {
+      id: tokens.sessionId,
+      userId: ctx.userId,
+      userType: 'live',
+      tokenHash: sha256(tokens.accessJti),
+      refreshHash: sha256(tokens.refreshJti),
+      expiresAt: tokens.refreshExpiresAt,
+      ipAddress,
+      userAgent,
+      fingerprintHash,
+    },
+  });
+
+  // Upsert known_devices if fingerprint present
+  if (fingerprintHash) {
+    await prismaWrite.knownDevice.upsert({
+      where: { userId_userType_fingerprintHash: { userId: ctx.userId, userType: 'live', fingerprintHash }},
+      create: { userId: ctx.userId, userType: 'live', fingerprintHash, label: deviceLabel },
+      update: { lastSeenAt: new Date() },
+    });
+  }
+
+  // Kafka journal event
+  await publishEvent('user.journal.events', ctx.userId, {
+    eventType: isNewDevice ? 'NEW_DEVICE_LOGIN' : 'LOGIN_SUCCESS',
+    userId: ctx.userId,
+    userType: 'live',
+    ipAddress,
+  });
+
+  return {
+    status: 'success',
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    expiresIn: 15 * 60,
+    tokenType: 'Bearer',
+    sessionId: tokens.sessionId,
+  };
+}

@@ -1,0 +1,395 @@
+import { Router, Request, Response } from 'express';
+import { z } from 'zod';
+import { validate } from '../middleware/validate';
+import { authenticate, authenticateLoginPending } from '../middleware/authenticate';
+import { otpSendRateLimit, totpRateLimit } from '../middleware/rateLimiter';
+import { sendOtp, setupTotp, confirmTotp, verifyTotpAtLogin, disableTotp } from '../modules/shared/otp-totp.service';
+import { requestPasswordReset, resetPassword, regenerateViewPassword } from '../modules/shared/password.service';
+import {
+  createHmacApiKey,
+  createSelfGeneratedApiKey,
+  listApiKeys,
+  updateApiKey,
+  revokeApiKey,
+  addIpToWhitelist,
+  removeIpFromWhitelist,
+} from '../modules/shared/apikey.service';
+import { issueTokensAndCreateSession } from '../modules/live/live.service';
+import { verifyOtpCode, createOtp } from '../utils/otp';
+import { verifyTotpCode } from '../utils/totp';
+import { hashFingerprint } from '../utils/hash';
+import { sendMail, otpEmailHtml } from '../lib/mailer';
+import { config } from '../config/env';
+import { prismaRead } from '../lib/prisma';
+import { AppError } from '../utils/errors';
+import { UserType } from '@prisma/client';
+
+const router = Router();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP
+// ─────────────────────────────────────────────────────────────────────────────
+
+const sendOtpSchema = z.object({
+  email:         z.string().email(),
+  purpose:       z.enum(['email_verify', 'forgot_password', 'withdrawal_confirm', 'twofa_setup']),
+  // Required when purpose === 'email_verify' — used to key the OTP per-account
+  accountNumber: z.string().optional(),
+});
+
+// POST /api/auth/otp/send
+router.post('/otp/send', otpSendRateLimit, validate(sendOtpSchema), async (req: Request, res: Response) => {
+  const { email, purpose, accountNumber } = req.body as { email: string; purpose: string; accountNumber?: string };
+
+  // ── email_verify: keyed by accountNumber (not email) ──────────────────────
+  // OTPs for this purpose are keyed by accountNumber so multiple accounts per
+  // email are correctly distinguished. The caller must always provide accountNumber.
+  if (purpose === 'email_verify') {
+    if (!accountNumber) {
+      throw new AppError('ACCOUNT_NUMBER_REQUIRED', 400, 'accountNumber is required when purpose is email_verify.');
+    }
+    // Guard: skip if already verified (fail-open if user-service unreachable)
+    try {
+      const userResp = await fetch(
+        `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
+        { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+      );
+      if (userResp.ok) {
+        const user = await userResp.json() as { isVerified?: boolean };
+        if (user.isVerified) {
+          res.status(400).json({ success: false, code: 'EMAIL_ALREADY_VERIFIED', message: 'This account has already been verified.' });
+          return;
+        }
+      }
+    } catch { /* user-service unreachable — proceed */ }
+
+    // Generate OTP keyed by accountNumber, then fire email non-fatally
+    const otp = await createOtp(accountNumber, 'email_verify');
+    void sendMail({
+      to: email,
+      subject: 'Your LiveFXHub verification code',
+      html: otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
+    }).catch(() => void 0);
+
+    res.json({ success: true, message: `Verification code sent to ${email}` });
+    return;
+  }
+
+  // All other purposes — delegate to sendOtp (keyed by email)
+  await sendOtp(email, purpose);
+  res.json({ success: true, message: `OTP sent to ${email}` });
+});
+
+// POST /api/auth/otp/verify — login 2FA gate (requires login_pending token)
+router.post('/otp/verify', authenticateLoginPending, async (req: Request, res: Response) => {
+  const { otp, deviceFingerprint, deviceLabel } = req.body as {
+    otp: string; deviceFingerprint?: string; deviceLabel?: string;
+  };
+  if (!otp) { res.status(400).json({ success: false, message: 'otp is required' }); return; }
+
+  const result = await verifyOtpCode(req.user!.sub, 'login', otp);
+  if (!result.success) throw new AppError(result.reason ?? 'INVALID_OTP', 400);
+
+  const userResp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
+    headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+  });
+  const ctx = await userResp.json() as {
+    userId: string; userType: 'live'; accountNumber: string;
+    groupName: string; currency: string; passwordHash: string; isActive: boolean;
+  };
+
+  const fp = deviceFingerprint ? hashFingerprint(deviceFingerprint) : null;
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
+  const ua = req.headers['user-agent'] ?? '';
+  const tokens = await issueTokensAndCreateSession(ctx, fp, deviceLabel ?? null, ip, ua, !!fp);
+  res.json({ success: true, data: tokens });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Email Verification
+// ─────────────────────────────────────────────────────────────────────────────
+
+const verifyEmailSchema = z.object({
+  accountNumber: z.string().min(1),
+  otp:           z.string().length(6),
+});
+
+/**
+ * POST /api/auth/verify-email
+ *
+ * Step-2 of the registration flow. The user submits the 6-digit OTP that was
+ * emailed on registration (or re-sent via POST /api/auth/otp/send).
+ *
+ * Flow:
+ *   1. Look up the live user by accountNumber via user-service internal API.
+ *   2. Verify the OTP stored in Redis under `otp:email_verify:<accountNumber>`.
+ *   3. If already verified: return 200 ALREADY_VERIFIED (idempotent).
+ *   4. PATCH user-service to mark isVerified = true.
+ *   5. Return 200 — frontend can now redirect to the login page.
+ *
+ * Why accountNumber (not email)? The system allows multiple accounts per email.
+ * Keying the OTP by accountNumber ensures the correct account is verified.
+ */
+router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, res: Response) => {
+  const { accountNumber, otp } = req.body as { accountNumber: string; otp: string };
+
+  // 1. Resolve user by accountNumber
+  const userResp = await fetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
+    { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+  );
+
+  if (!userResp.ok) {
+    if (userResp.status === 403) {
+      throw new AppError('INTERNAL_SERVICE_UNAUTHORIZED', 500, 'Internal service authentication failed');
+    }
+    // 404 — account not yet created by Kafka consumer; tell user to retry shortly
+    throw new AppError('ACCOUNT_NOT_FOUND', 404, 'Account not found. If you just registered, please wait a moment and try again.');
+  }
+
+  const user = await userResp.json() as { userId: string; isVerified?: boolean };
+
+  // 2. Already verified — idempotent short-circuit
+  if (user.isVerified) {
+    res.json({ success: true, code: 'ALREADY_VERIFIED', message: 'Your email is already verified. You can log in.' });
+    return;
+  }
+
+  // 3. Verify OTP — keyed by accountNumber (set by registerLiveUser)
+  const result = await verifyOtpCode(accountNumber, 'email_verify', otp);
+  if (!result.success) {
+    const codeMap: Record<string, number> = {
+      EXPIRED_OR_NOT_FOUND: 400,
+      MAX_ATTEMPTS_EXCEEDED: 429,
+      INVALID_OTP: 400,
+    };
+    throw new AppError(result.reason ?? 'INVALID_OTP', codeMap[result.reason ?? ''] ?? 400);
+  }
+
+  // 4. Mark email as verified in user-service
+  const patchResp = await fetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${user.userId}/verify-email`,
+    { method: 'PATCH', headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+  );
+  if (!patchResp.ok) throw new AppError('EMAIL_VERIFY_PATCH_FAILED', 502);
+
+  res.json({ success: true, message: 'Email verified successfully. You can now log in.' });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/auth/totp/setup  [auth required]
+router.post('/totp/setup', authenticate, totpRateLimit, async (req: Request, res: Response) => {
+  const { sub: userId, userType, accountNumber } = req.user!;
+
+  // Best-effort: fetch the user's email from user-service so the authenticator app
+  // shows "LiveFXHub:<email>" as the account label in the QR code.
+  // If user-service is unreachable, fall back to accountNumber — TOTP still works correctly.
+  let totpLabel = accountNumber;
+  try {
+    const userResp = await fetch(
+      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${userId}?userType=${userType}`,
+      { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+    );
+    if (userResp.ok) {
+      const userCtx = await userResp.json() as { email?: string };
+      if (userCtx.email) totpLabel = userCtx.email;
+    }
+  } catch {
+    // user-service unreachable — use accountNumber as fallback label, proceed normally
+  }
+
+  const result = await setupTotp(userId, userType, totpLabel);
+  res.json({ success: true, data: result });
+});
+
+// POST /api/auth/totp/confirm  [auth required]
+router.post('/totp/confirm', authenticate, totpRateLimit, async (req: Request, res: Response) => {
+  const { code } = req.body as { code: string };
+  if (!code) { res.status(400).json({ success: false, message: 'code is required' }); return; }
+  const result = await confirmTotp(req.user!.sub, req.user!.userType, code);
+  res.json({ success: true, ...result });
+});
+
+// POST /api/auth/totp/verify — login 2FA gate (requires login_pending token)
+router.post('/totp/verify', authenticateLoginPending, totpRateLimit, async (req: Request, res: Response) => {
+  const { code, deviceFingerprint, deviceLabel } = req.body as {
+    code: string; deviceFingerprint?: string; deviceLabel?: string;
+  };
+  if (!code) { res.status(400).json({ success: false, message: 'code is required' }); return; }
+
+  await verifyTotpAtLogin(req.user!.sub, req.user!.userType, code);
+
+  const userResp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
+    headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+  });
+  const ctx = await userResp.json() as {
+    userId: string; userType: 'live'; accountNumber: string;
+    groupName: string; currency: string; passwordHash: string; isActive: boolean;
+  };
+
+  const fp = deviceFingerprint ? hashFingerprint(deviceFingerprint) : null;
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
+  const ua = req.headers['user-agent'] ?? '';
+  const tokens = await issueTokensAndCreateSession(ctx, fp, deviceLabel ?? null, ip, ua, false);
+  res.json({ success: true, data: tokens });
+});
+
+// DELETE /api/auth/totp  [auth required]
+router.delete('/totp', authenticate, async (req: Request, res: Response) => {
+  const { code } = req.body as { code: string };
+  if (!code) { res.status(400).json({ success: false, message: 'code is required to disable 2FA' }); return; }
+  const result = await disableTotp(req.user!.sub, req.user!.userType, code);
+  res.json({ success: true, ...result });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Password
+// ─────────────────────────────────────────────────────────────────────────────
+
+const forgotSchema  = z.object({ email: z.string().email(), userType: z.enum(['live', 'demo']) });
+const resetSchema   = z.object({ resetToken: z.string().min(1), newPassword: z.string().min(8) });
+
+router.post('/password/forgot', otpSendRateLimit, validate(forgotSchema), async (req: Request, res: Response) => {
+  await requestPasswordReset(req.body.email, req.body.userType);
+  res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
+});
+
+router.post('/password/reset', validate(resetSchema), async (req: Request, res: Response) => {
+  const result = await resetPassword(req.body.resetToken, req.body.newPassword);
+  res.json({ success: true, ...result });
+});
+
+router.post('/regenerate-view-password', authenticate, async (req: Request, res: Response) => {
+  const result = await regenerateViewPassword(req.user!.sub, req.user!.userType);
+  res.json({ success: true, data: result });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API Keys — 2FA-gated mutation guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sensitive API key operations (create, edit label/permissions, revoke, IP whitelist mutations)
+ * require a fresh OTP or TOTP code to be passed in the request body.
+ * This middleware checks `x-api-key-code` header against the user's active 2FA method.
+ */
+async function requireApiKeyCode(req: Request, res: Response, next: () => void): Promise<void> {
+  const code = req.headers['x-api-key-code'] as string | undefined;
+  if (!code) {
+    res.status(400).json({
+      success: false,
+      message: 'This operation requires a 2FA code. Pass it in the X-Api-Key-Code header.',
+    });
+    return;
+  }
+
+  const userId   = req.user!.sub;
+  const userType = req.user!.userType;
+
+  // Try TOTP first
+  const totpRecord = await prismaRead.userTotpSecret.findUnique({
+    where: { userId_userType: { userId, userType: userType as UserType } },
+  });
+
+  if (totpRecord?.isVerified) {
+    const valid = verifyTotpCode(totpRecord.secretEnc, code);
+    if (!valid) { res.status(400).json({ success: false, message: 'Invalid authenticator code' }); return; }
+  } else {
+    // Fall back to email OTP (must have been sent via /api/auth/otp/send with purpose twofa_setup)
+    const result = await verifyOtpCode(userId, 'twofa_setup', code);
+    if (!result.success) { res.status(400).json({ success: false, message: 'Invalid or expired OTP code' }); return; }
+  }
+
+  next();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API Keys — Endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+const createHmacSchema = z.object({
+  label:         z.string().min(1).max(100),
+  permissions:   z.array(z.string()).optional(),
+  expiresInDays: z.coerce.number().int().min(1).max(365).optional(),
+});
+
+const createSelfGenSchema = z.object({
+  label:         z.string().min(1).max(100),
+  keyType:       z.enum(['rsa', 'ed25519']),
+  publicKey:     z.string().min(50),   // PEM string
+  permissions:   z.array(z.string()).optional(),
+  expiresInDays: z.coerce.number().int().min(1).max(365).optional(),
+});
+
+const updateKeySchema = z.object({
+  label:       z.string().min(1).max(100).optional(),
+  permissions: z.array(z.string()).min(1).optional(),
+}).refine((d) => d.label !== undefined || d.permissions !== undefined, {
+  message: 'At least one of label or permissions is required',
+});
+
+const addIpSchema = z.object({
+  ipAddress: z.string().ip(),
+  label:     z.string().optional(),
+});
+
+// GET — list all API keys (no 2FA required)
+router.get('/api-keys', authenticate, async (req: Request, res: Response) => {
+  const keys = await listApiKeys(req.user!.sub, req.user!.userType);
+  res.json({ success: true, data: keys });
+});
+
+// POST — create HMAC key  [2FA required via X-Api-Key-Code header]
+router.post('/api-keys/hmac', authenticate, validate(createHmacSchema), requireApiKeyCode, async (req: Request, res: Response) => {
+  const result = await createHmacApiKey({
+    userId:        req.user!.sub,
+    userType:      req.user!.userType,
+    label:         req.body.label,
+    permissions:   req.body.permissions,
+    expiresInDays: req.body.expiresInDays,
+  });
+  res.status(201).json({ success: true, data: result });
+});
+
+// POST — create RSA/Ed25519 key  [2FA required]
+router.post('/api-keys/self-generated', authenticate, validate(createSelfGenSchema), requireApiKeyCode, async (req: Request, res: Response) => {
+  const result = await createSelfGeneratedApiKey({
+    userId:        req.user!.sub,
+    userType:      req.user!.userType,
+    label:         req.body.label,
+    keyType:       req.body.keyType,
+    publicKey:     req.body.publicKey,
+    permissions:   req.body.permissions,
+    expiresInDays: req.body.expiresInDays,
+  });
+  res.status(201).json({ success: true, data: result });
+});
+
+// PATCH — edit label / permissions  [2FA required]
+router.patch('/api-keys/:id', authenticate, validate(updateKeySchema), requireApiKeyCode, async (req: Request, res: Response) => {
+  const result = await updateApiKey(
+    req.user!.sub, req.params.id!, req.body.label, req.body.permissions,
+  );
+  res.json({ success: true, data: result });
+});
+
+// DELETE — revoke key  [2FA required]
+router.delete('/api-keys/:id', authenticate, requireApiKeyCode, async (req: Request, res: Response) => {
+  await revokeApiKey(req.user!.sub, req.params.id!);
+  res.json({ success: true, message: 'API key revoked' });
+});
+
+// POST — add IP to whitelist  [2FA required]
+router.post('/api-keys/:id/ips', authenticate, validate(addIpSchema), requireApiKeyCode, async (req: Request, res: Response) => {
+  const result = await addIpToWhitelist(req.user!.sub, req.params.id!, req.body.ipAddress, req.body.label);
+  res.status(201).json({ success: true, data: result });
+});
+
+// DELETE — remove IP  [2FA required]
+router.delete('/api-keys/:id/ips/:ipId', authenticate, requireApiKeyCode, async (req: Request, res: Response) => {
+  await removeIpFromWhitelist(req.user!.sub, req.params.id!, req.params.ipId!);
+  res.json({ success: true, message: 'IP removed from whitelist' });
+});
+
+export default router;
