@@ -1,6 +1,6 @@
 import { prismaWrite, prismaRead } from '../../lib/prisma';
 import { hashPassword, verifyPassword, sha256, hashFingerprint } from '../../utils/hash';
-import { signTokenPair, signLoginPendingToken } from '../../utils/jwt';
+import { signTokenPair, signLoginPendingToken, signPortalToken } from '../../utils/jwt';
 import { generateAccountNumber } from '../../utils/accountNumber';
 import { createOtp } from '../../utils/otp';
 import { sendMail, otpEmailHtml, newDeviceAlertHtml } from '../../lib/mailer';
@@ -23,14 +23,14 @@ function fireEmail(task: Promise<void>, context: Record<string, unknown>): void 
 // ── Register ──────────────────────────────────────────────────────────────────
 
 export async function registerLiveUser(input: LiveRegisterInput) {
-  // Account number from Redis atomic counter
-  const accountNumber = await generateAccountNumber('LU');
-  const passwordHash = await hashPassword(input.password);
+  const accountNumber       = await generateAccountNumber('LU');
+  const masterPasswordHash  = await hashPassword(input.password);
+  // Auto-generate a secure random MT5 trading password (shown once in welcome email)
+  const tradingPassword     = generateSecurePassword();
+  const tradingPasswordHash = await hashPassword(tradingPassword);
 
   // ── Phone pre-flight check ──────────────────────────────────────────────────
-  // Check before publishing to Kafka so the user gets an immediate 409 instead of
-  // a silent drop by the Kafka consumer. If user-service is unreachable, skip the
-  // check (fail-open) and let the consumer handle it.
+  // Check before Kafka so user gets an immediate 409 instead of silent drop.
   try {
     const phoneResp = await fetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-phone/${encodeURIComponent(input.phoneNumber)}?ownerEmail=${encodeURIComponent(input.email)}`,
@@ -43,218 +43,326 @@ export async function registerLiveUser(input: LiveRegisterInput) {
       }
     }
   } catch (err) {
-    // Re-throw AppError (phone conflict) — only swallow network errors
     if (err instanceof AppError) throw err;
-    logger.warn({ err }, '[register] Phone pre-flight check failed — proceeding without check');
+    logger.warn({ err }, '[register] Phone pre-flight check failed — proceeding');
   }
 
-  // Publish to Kafka → user-service will create the actual user row
+  // Publish to Kafka — user-service will create the UserProfile + LiveUser
   await publishEvent('user.register', accountNumber, {
-    type: 'LIVE_USER_REGISTER',
+    type:               'LIVE_USER_REGISTER',
     accountNumber,
-    passwordHash,
-    email: input.email,
-    phoneNumber: input.phoneNumber,
-    country: input.country,
-    groupName: input.groupName,
-    currency: 'USD',
-    leverage: 100,
-    isSelfTrading: true,
+    masterPasswordHash,
+    tradingPasswordHash,
+    email:              input.email,
+    phoneNumber:        input.phoneNumber,
+    country:            input.country,
+    groupName:          input.groupName,
+    currency:           input.currency,
+    leverage:           input.leverage,
+    isSelfTrading:      true,
   });
 
-  // OTP keyed by accountNumber (NOT email) — this supports multiple accounts
-  // per email. The frontend receives accountNumber and passes it to /verify-email.
+  // OTP keyed by accountNumber to support multiple accounts per email
   const otp = await createOtp(accountNumber, 'email_verify');
   fireEmail(
     sendMail({
-      to: input.email,
+      to:      input.email,
       subject: 'Verify your LiveFXHub account',
-      html: otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
+      html:    otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
     }),
     { email: input.email, accountNumber, purpose: 'email_verify' },
   );
 
-  return { accountNumber, message: 'Account created. Please verify your email.' };
+  return {
+    accountNumber,
+    message: 'Account created. Please verify your email.',
+  };
 }
 
-// ── Login ─────────────────────────────────────────────────────────────────────
+// ── Login Flow ────────────────────────────────────────────────────────────────
 
-interface LoginContext {
-  userId: string;
-  userType: 'live';
-  accountNumber: string;
-  groupName: string;
-  currency: string;
-  passwordHash: string;
-  isActive: boolean;
+/**
+ * Portal context returned by user-service for email-based login.
+ * Contains the UserProfile data + list of trading accounts.
+ */
+interface PortalContext {
+  profileId:          string;
+  email:              string;
+  masterPasswordHash: string;
+  isVerified:         boolean;
+  accounts: Array<{
+    accountNumber: string;
+    type:          string;
+    currency:      string;
+    leverage:      number;
+    groupName:     string;
+    isActive:      boolean;
+  }>;
 }
 
 /**
- * Fetches live user context from user-service via internal HTTP call.
- * In dev, we can also pass a resolved context directly.
+ * Trading account context used to mint a specific account's Trading JWT.
  */
-async function getLiveUserContext(email: string): Promise<LoginContext | null> {
+export interface LoginContext {
+  userId:        string;
+  profileId?:    string;
+  userType:      'live';
+  accountNumber: string;
+  groupName:     string;
+  currency:      string;
+  passwordHash:  string;
+  isActive:      boolean;
+}
+
+async function getPortalContext(email: string): Promise<PortalContext | null> {
   try {
-    const resp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-service-secret': config.internalSecret,
+    const resp = await fetch(
+      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
+        body:    JSON.stringify({ email, userType: 'live' }),
       },
-      body: JSON.stringify({ email, userType: 'live' }),
-    });
+    );
     if (!resp.ok) return null;
-    return (await resp.json()) as LoginContext;
+    return (await resp.json()) as PortalContext;
+  } catch {
+    return null;
+  }
+}
+
+async function getLiveAccountContext(accountNumber: string): Promise<LoginContext | null> {
+  try {
+    const resp = await fetch(
+      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
+      { headers: { 'x-service-secret': config.internalSecret } },
+    );
+    if (!resp.ok) return null;
+    const ctx = await resp.json() as LoginContext & { profileId: string };
+    return { ...ctx, userType: 'live' };
   } catch {
     return null;
   }
 }
 
 export async function loginLiveUser(
-  input: LiveLoginInput,
+  input:     LiveLoginInput,
   ipAddress: string,
   userAgent: string,
 ) {
-  // Fetch user from user-service
-  const ctx = await getLiveUserContext(input.email);
-  if (!ctx) throw new AppError('INVALID_CREDENTIALS', 401);
-  if (!ctx.isActive) throw new AppError('ACCOUNT_INACTIVE', 403);
+  // 1. Fetch the UserProfile (not the trading account — master password lives here)
+  const portal = await getPortalContext(input.email);
+  if (!portal) throw new AppError('INVALID_CREDENTIALS', 401);
 
-  // Verify password
-  const passwordOk = await verifyPassword(input.password, ctx.passwordHash);
+  // 2. Verify master (web portal) password
+  const passwordOk = await verifyPassword(input.password, portal.masterPasswordHash);
   if (!passwordOk) throw new AppError('INVALID_CREDENTIALS', 401);
 
-  const fingerprintHash = input.deviceFingerprint
-    ? hashFingerprint(input.deviceFingerprint)
-    : null;
+  const activeAccounts = portal.accounts.filter(a => a.isActive);
 
-  // ── Device check ──────────────────────────────────────────────────────────
-  let requires2FA = false;
-  let isNewDevice = false;
-
-  if (fingerprintHash) {
-    const knownDevice = await prismaRead.knownDevice.findUnique({
-      where: { userId_userType_fingerprintHash: {
-        userId: ctx.userId,
-        userType: 'live',
-        fingerprintHash,
-      }},
-    });
-
-    if (!knownDevice) {
-      // Brand new device
-      isNewDevice = true;
-      requires2FA = true;
-    } else {
-      // Known device — check inactivity
-      const daysSinceLastSeen = (Date.now() - knownDevice.lastSeenAt.getTime()) / 86_400_000;
-      if (daysSinceLastSeen > config.inactivity2faDays) {
-        requires2FA = true;
-      }
-    }
-  }
-
-  // ── If 2FA required, return login_pending token ───────────────────────────
-  if (requires2FA) {
-    // Check if user has TOTP set up
-    const totpRecord = await prismaRead.userTotpSecret.findUnique({
-      where: { userId_userType: { userId: ctx.userId, userType: 'live' } },
-    });
-    const hasTOTP = totpRecord?.isVerified ?? false;
-
-    const loginToken = signLoginPendingToken(ctx.userId, 'live');
-
-    if (!hasTOTP) {
-      // Generate + store OTP in Redis, then fire email non-fatally.
-      // The loginToken is returned regardless of email delivery outcome.
-      const otp = await createOtp(ctx.userId, 'login');
-      fireEmail(
-        sendMail({
-          to: input.email,
-          subject: 'Your LiveFXHub login code',
-          html: otpEmailHtml(otp, 'login verification', config.otpExpiresInMinutes),
-        }),
-        { userId: ctx.userId, purpose: 'login' },
-      );
-    }
-
-    // New device — send alert email async (non-blocking)
-    if (isNewDevice && config.newDeviceAlert) {
-      sendMail({
-        to: input.email,
-        subject: '⚠️ New device login detected — LiveFXHub',
-        html: newDeviceAlertHtml(
-          input.deviceLabel ?? userAgent,
-          ipAddress,
-          new Date().toISOString(),
-        ),
-      }).catch(() => void 0);
-    }
-
+  // 3. Multi-account check: if user has multiple active live accounts, issue
+  //    a Portal JWT so the frontend can show an account picker.
+  if (activeAccounts.length > 1) {
+    const portalToken = signPortalToken(portal.profileId, 'live');
     return {
-      status: hasTOTP ? 'totp_required' : 'otp_required',
-      loginToken,
-      message: hasTOTP
-        ? 'Enter your authenticator code to continue'
-        : 'A verification code has been sent to your email',
+      status:       'account_selection_required',
+      portalToken,
+      accounts:     activeAccounts,
+      message:      'Select an account to continue',
     };
   }
 
-  // ── Issue tokens directly ─────────────────────────────────────────────────
-  return await issueTokensAndCreateSession(ctx, fingerprintHash, input.deviceLabel ?? null, ipAddress, userAgent, isNewDevice);
+  // 4. Single account — proceed with device check + session creation
+  if (activeAccounts.length === 0) throw new AppError('NO_ACTIVE_ACCOUNTS', 403);
+
+  const accountCtx = await getLiveAccountContext(activeAccounts[0]!.accountNumber);
+  if (!accountCtx) throw new AppError('INVALID_CREDENTIALS', 401);
+
+  return await runDeviceCheckAndIssueTokens(
+    accountCtx,
+    portal.email,
+    {
+      ...(input.deviceFingerprint !== undefined && { deviceFingerprint: input.deviceFingerprint }),
+      ...(input.deviceLabel !== undefined && { deviceLabel: input.deviceLabel }),
+    },
+    ipAddress,
+    userAgent,
+  );
 }
 
+// ── Account selection (after portal login) ────────────────────────────────────
+
+/**
+ * Called from POST /api/live/select-account.
+ * Validates the Portal JWT owns the requested account, then issues a Trading JWT.
+ */
+export async function selectAccount(
+  profileId:     string,
+  accountNumber: string,
+  input:         { deviceFingerprint?: string; deviceLabel?: string },
+  ipAddress:     string,
+  userAgent:     string,
+  email:         string,
+) {
+  const accountCtx = await getLiveAccountContext(accountNumber);
+  if (!accountCtx) throw new AppError('ACCOUNT_NOT_FOUND', 404);
+  if (accountCtx.profileId !== profileId) throw new AppError('ACCOUNT_FORBIDDEN', 403);
+
+  return await runDeviceCheckAndIssueTokens(accountCtx, email, input, ipAddress, userAgent);
+}
+
+// ── Open new trading account (in-portal) ─────────────────────────────────────
+
+export async function openNewAccount(
+  profileId: string,
+  options: { groupName: string; currency: string; leverage: number; tradingPassword?: string },
+) {
+  const accountNumber       = await generateAccountNumber('LU');
+  const rawPassword         = options.tradingPassword ?? generateSecurePassword();
+  const tradingPasswordHash = await hashPassword(rawPassword);
+  const showPassword        = !options.tradingPassword; // show if auto-generated
+
+  await fetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/accounts`,
+    {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
+      body:    JSON.stringify({
+        profileId,
+        accountNumber,
+        tradingPasswordHash,
+        groupName: options.groupName,
+        currency:  options.currency,
+        leverage:  options.leverage,
+      }),
+    },
+  );
+
+  return {
+    accountNumber,
+    ...(showPassword ? { tradingPassword: rawPassword, tradingPasswordNote: 'Save this — it will not be shown again.' } : {}),
+  };
+}
+
+// ── Issue tokens ──────────────────────────────────────────────────────────────
+
 export async function issueTokensAndCreateSession(
-  ctx: LoginContext,
+  ctx:           LoginContext,
   fingerprintHash: string | null,
-  deviceLabel: string | null,
-  ipAddress: string,
-  userAgent: string,
-  isNewDevice: boolean,
+  deviceLabel:   string | null,
+  ipAddress:     string,
+  userAgent:     string,
+  isNewDevice:   boolean,
 ) {
   const tokens = signTokenPair(ctx.userId, ctx.userType, ctx.accountNumber, {
     groupName: ctx.groupName,
-    currency: ctx.currency,
+    currency:  ctx.currency,
   });
 
-  // Create session row
   await prismaWrite.session.create({
     data: {
-      id: tokens.sessionId,
-      userId: ctx.userId,
-      userType: 'live',
-      tokenHash: sha256(tokens.accessJti),
-      refreshHash: sha256(tokens.refreshJti),
-      expiresAt: tokens.refreshExpiresAt,
+      id:             tokens.sessionId,
+      userId:         ctx.userId,
+      userType:       'live',
+      tokenHash:      sha256(tokens.accessJti),
+      refreshHash:    sha256(tokens.refreshJti),
+      expiresAt:      tokens.refreshExpiresAt,
       ipAddress,
       userAgent,
       fingerprintHash,
     },
   });
 
-  // Upsert known_devices if fingerprint present
   if (fingerprintHash) {
     await prismaWrite.knownDevice.upsert({
-      where: { userId_userType_fingerprintHash: { userId: ctx.userId, userType: 'live', fingerprintHash }},
+      where:  { userId_userType_fingerprintHash: { userId: ctx.userId, userType: 'live', fingerprintHash } },
       create: { userId: ctx.userId, userType: 'live', fingerprintHash, label: deviceLabel },
       update: { lastSeenAt: new Date() },
     });
   }
 
-  // Kafka journal event
   await publishEvent('user.journal.events', ctx.userId, {
     eventType: isNewDevice ? 'NEW_DEVICE_LOGIN' : 'LOGIN_SUCCESS',
-    userId: ctx.userId,
-    userType: 'live',
+    userId:    ctx.userId,
+    userType:  'live',
     ipAddress,
   });
 
   return {
-    status: 'success',
-    accessToken: tokens.accessToken,
+    status:       'success',
+    accessToken:  tokens.accessToken,
     refreshToken: tokens.refreshToken,
-    expiresIn: 15 * 60,
-    tokenType: 'Bearer',
-    sessionId: tokens.sessionId,
+    expiresIn:    15 * 60,
+    tokenType:    'Bearer',
+    sessionId:    tokens.sessionId,
   };
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+async function runDeviceCheckAndIssueTokens(
+  accountCtx: LoginContext,
+  email:      string,
+  input:      { deviceFingerprint?: string; deviceLabel?: string },
+  ipAddress:  string,
+  userAgent:  string,
+) {
+  const fingerprintHash = input.deviceFingerprint ? hashFingerprint(input.deviceFingerprint) : null;
+  let requires2FA = false;
+  let isNewDevice  = false;
+
+  if (fingerprintHash) {
+    const knownDevice = await prismaRead.knownDevice.findUnique({
+      where: { userId_userType_fingerprintHash: { userId: accountCtx.userId, userType: 'live', fingerprintHash } },
+    });
+    if (!knownDevice) {
+      isNewDevice  = true;
+      requires2FA  = true;
+    } else {
+      const daysSinceLastSeen = (Date.now() - knownDevice.lastSeenAt.getTime()) / 86_400_000;
+      if (daysSinceLastSeen > config.inactivity2faDays) requires2FA = true;
+    }
+  }
+
+  if (requires2FA) {
+    const totpRecord = await prismaRead.userTotpSecret.findUnique({
+      where: { userId_userType: { userId: accountCtx.userId, userType: 'live' } },
+    });
+    const hasTOTP    = totpRecord?.isVerified ?? false;
+    const loginToken = signLoginPendingToken(accountCtx.userId, 'live');
+
+    if (!hasTOTP) {
+      const otp = await createOtp(accountCtx.userId, 'login');
+      fireEmail(
+        sendMail({
+          to:      email,
+          subject: 'Your LiveFXHub login code',
+          html:    otpEmailHtml(otp, 'login verification', config.otpExpiresInMinutes),
+        }),
+        { userId: accountCtx.userId, purpose: 'login' },
+      );
+    }
+
+    if (isNewDevice && config.newDeviceAlert) {
+      sendMail({
+        to:      email,
+        subject: '⚠️ New device login detected — LiveFXHub',
+        html:    newDeviceAlertHtml(input.deviceLabel ?? userAgent, ipAddress, new Date().toISOString()),
+      }).catch(() => void 0);
+    }
+
+    return {
+      status:     hasTOTP ? 'totp_required' : 'otp_required',
+      loginToken,
+      message:    hasTOTP ? 'Enter your authenticator code' : 'A verification code has been sent to your email',
+    };
+  }
+
+  return await issueTokensAndCreateSession(accountCtx, fingerprintHash, input.deviceLabel ?? null, ipAddress, userAgent, isNewDevice);
+}
+
+/** Generate a secure random 12-char alphanumeric + symbol password */
+function generateSecurePassword(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%';
+  return Array.from({ length: 12 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 }

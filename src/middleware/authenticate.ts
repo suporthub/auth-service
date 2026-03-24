@@ -14,10 +14,8 @@ declare global {
 
 /**
  * JWT authentication middleware.
- * 1. Extracts Bearer token from Authorization header
- * 2. Verifies signature + expiry
- * 3. Checks typ = 'access' (rejects refresh / login_pending tokens)
- * 4. Validates session still exists in DB (not revoked)
+ * Accepts both 'access' (Trading JWT) and 'portal' JWT types.
+ * Portal JWTs are issued when a user has multiple accounts pending selection.
  */
 export async function authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
@@ -36,16 +34,47 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     return;
   }
 
-  if (payload.typ !== 'access') {
+  if (payload.typ !== 'access' && payload.typ !== 'portal') {
     res.status(401).json({ success: false, message: 'Invalid token type' });
     return;
   }
 
-  // Check session is not revoked in DB
-  const tokenHash = sha256(payload.jti);
-  const session = await prismaRead.session.findUnique({ where: { tokenHash } });
-  if (!session || session.revokedAt !== null || session.expiresAt < new Date()) {
-    res.status(401).json({ success: false, message: 'Session expired or revoked' });
+  // Portal tokens don't have a session row — skip DB check
+  if (payload.typ === 'access') {
+    const tokenHash = sha256(payload.jti);
+    const session = await prismaRead.session.findUnique({ where: { tokenHash } });
+    if (!session || session.revokedAt !== null || session.expiresAt < new Date()) {
+      res.status(401).json({ success: false, message: 'Session expired or revoked' });
+      return;
+    }
+  }
+
+  req.user = payload;
+  next();
+}
+
+/**
+ * Requires a Portal JWT (typ='portal').
+ * Used for POST /api/live/select-account to prevent Trading JWTs from selecting accounts.
+ */
+export async function authenticatePortal(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ success: false, message: 'Missing portal token' });
+    return;
+  }
+
+  const token = authHeader.slice(7);
+  let payload: JwtPayload;
+  try {
+    payload = verifyToken(token);
+  } catch {
+    res.status(401).json({ success: false, message: 'Invalid or expired portal token' });
+    return;
+  }
+
+  if (payload.typ !== 'portal') {
+    res.status(401).json({ success: false, message: 'A portal token is required for account selection' });
     return;
   }
 

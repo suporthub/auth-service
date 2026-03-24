@@ -6,7 +6,7 @@ export interface JwtPayload {
   jti: string;
   sub: string;     // user UUID
   sid: string;     // session UUID
-  typ: 'access' | 'refresh' | 'login_pending';
+  typ: 'access' | 'refresh' | 'login_pending' | 'portal';
   userType: string;
   accountNumber: string;
   groupName?: string;
@@ -83,4 +83,13 @@ export function verifyToken(token: string): JwtPayload {
     issuer: 'livefxhub-auth',
     audience: 'livefxhub-api',
   }) as JwtPayload;
+}
+
+/** Portal JWT — issued when user has multiple accounts; scoped to profileId only. */
+export function signPortalToken(profileId: string, userType: string): string {
+  return jwt.sign(
+    { sub: profileId, userType, typ: 'portal', jti: uuidv4() } as object,
+    config.jwtSecret,
+    { expiresIn: '10m', issuer: 'livefxhub-auth', audience: 'livefxhub-api' } as SignOptions,
+  );
 }
