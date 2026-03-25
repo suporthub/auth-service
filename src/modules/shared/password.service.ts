@@ -1,7 +1,7 @@
 import { prismaWrite, prismaRead } from '../../lib/prisma';
 import { hashPassword, sha256 } from '../../utils/hash';
 import { AppError } from '../../utils/errors';
-import { sendMail, otpEmailHtml } from '../../lib/mailer';
+import { notify } from '../../lib/notifier';
 import { createOtp, verifyOtpCode } from '../../utils/otp';
 import { config } from '../../config/env';
 import { randomBytes } from 'crypto';
@@ -11,11 +11,7 @@ import { UserType } from '@prisma/client';
 export async function requestPasswordReset(email: string, _userType: 'live' | 'demo') {
   // Always respond success (prevents user enumeration)
   const otp = await createOtp(email, 'forgot_password');
-  await sendMail({
-    to: email,
-    subject: 'Reset your LiveFXHub password',
-    html: otpEmailHtml(otp, 'password reset', config.otpExpiresInMinutes),
-  });
+  void notify.passwordReset(email, otp, config.otpExpiresInMinutes);
 }
 
 /** Step 2: User verifies OTP → gets a short-lived reset token */

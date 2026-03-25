@@ -4,7 +4,7 @@ import { signTokenPair } from '../../utils/jwt';
 import { createOtp, verifyOtpCode } from '../../utils/otp';
 import { verifyTotpCode } from '../../utils/totp';
 import { prismaRead } from '../../lib/prisma';
-import { sendMail, otpEmailHtml } from '../../lib/mailer';
+import { notify } from '../../lib/notifier';
 import { publishEvent } from '../../lib/kafka';
 import { AppError } from '../../utils/errors';
 import { config } from '../../config/env';
@@ -35,13 +35,9 @@ export async function adminLoginStep1(email: string, password: string) {
   const hasTOTP = totpRecord?.isVerified ?? false;
 
   if (!hasTOTP) {
-    // No TOTP — send email OTP
+    // No TOTP — send email OTP via notification-service
     const otp = await createOtp(email, 'login');
-    await sendMail({
-      to: email,
-      subject: 'Your LiveFXHub admin login code',
-      html: otpEmailHtml(otp, 'admin login', config.otpExpiresInMinutes),
-    });
+    void notify.otp(email, otp, 'Admin Login', config.otpExpiresInMinutes);
   }
 
   return {
@@ -82,11 +78,17 @@ export async function adminLoginStep2(
   const permResp = await fetch(`${process.env.ADMIN_SERVICE_INTERNAL_URL}/internal/admins/${adminId}/permissions`, {
     headers: { 'x-service-secret': config.internalSecret },
   });
-  const { permissions, accountNumber } = await permResp.json() as {
+  const permCtx = await permResp.json() as {
     permissions: string[]; accountNumber: string;
+    allCountries: boolean; countryCodes: string[];
   };
 
-  const tokens = signTokenPair(adminId, 'admin', accountNumber ?? 'ADMIN', { permissions });
+  const tokens = signTokenPair(adminId, 'admin', permCtx.accountNumber ?? 'ADMIN', {
+    permissions:  permCtx.permissions,
+    allCountries: permCtx.allCountries,
+    // Omit countryCodes from JWT when allCountries=true — keeps token small
+    ...(permCtx.allCountries ? {} : { countryCodes: permCtx.countryCodes }),
+  });
 
   await prismaWrite.session.create({
     data: {

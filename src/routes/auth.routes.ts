@@ -18,7 +18,7 @@ import { issueTokensAndCreateSession } from '../modules/live/live.service';
 import { verifyOtpCode, createOtp } from '../utils/otp';
 import { verifyTotpCode } from '../utils/totp';
 import { hashFingerprint } from '../utils/hash';
-import { sendMail, otpEmailHtml } from '../lib/mailer';
+import { notify } from '../lib/notifier';
 import { config } from '../config/env';
 import { prismaRead } from '../lib/prisma';
 import { AppError } from '../utils/errors';
@@ -65,11 +65,7 @@ router.post('/otp/send', otpSendRateLimit, validate(sendOtpSchema), async (req: 
 
     // Generate OTP keyed by accountNumber, then fire email non-fatally
     const otp = await createOtp(accountNumber, 'email_verify');
-    void sendMail({
-      to: email,
-      subject: 'Your LiveFXHub verification code',
-      html: otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
-    }).catch(() => void 0);
+    void notify.otp(email, otp, 'Email Verification', config.otpExpiresInMinutes);
 
     res.json({ success: true, message: `Verification code sent to ${email}` });
     return;

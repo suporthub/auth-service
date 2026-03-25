@@ -5,10 +5,13 @@ export const liveRegisterSchema = z.object({
   phoneNumber: z.string().min(7).max(20),
   password:    z.string().min(8, 'Password must be at least 8 characters'),
   groupName:   z.string().default('Standard'),
-  country:     z.string().min(2).max(100),
+  country:     z.string().length(2).transform((v) => v.toUpperCase()).pipe(
+    z.string().regex(/^[A-Z]{2}$/, 'country must be a valid ISO-2 country code (e.g. "IN", "AE", "US")')
+  ),
   // Optional — defaults applied downstream (USD, 100)
-  currency:    z.string().default('USD'),
-  leverage:    z.number().int().positive().default(100),
+  currency:     z.string().default('USD'),
+  leverage:     z.number().int().positive().default(100),
+  referralCode: z.string().optional(),
 });
 
 export type LiveRegisterInput = z.infer<typeof liveRegisterSchema>;

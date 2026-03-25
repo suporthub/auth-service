@@ -1,7 +1,7 @@
 import { prismaWrite, prismaRead } from '../../lib/prisma';
 import { createOtp } from '../../utils/otp';
 import { generateTotpSetup, verifyTotpCode } from '../../utils/totp';
-import { sendMail, otpEmailHtml } from '../../lib/mailer';
+import { notify } from '../../lib/notifier';
 import { AppError } from '../../utils/errors';
 import { config } from '../../config/env';
 import { UserType } from '@prisma/client';
@@ -12,11 +12,7 @@ export async function sendOtp(
   purpose: string,
 ) {
   const otp = await createOtp(identifier, purpose);
-  await sendMail({
-    to: identifier,
-    subject: 'Your LiveFXHub verification code',
-    html: otpEmailHtml(otp, purpose.replace(/_/g, ' '), config.otpExpiresInMinutes),
-  });
+  void notify.otp(identifier, otp, purpose.replace(/_/g, ' '), config.otpExpiresInMinutes);
 }
 
 // ── TOTP setup ────────────────────────────────────────────────────────────────

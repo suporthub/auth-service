@@ -3,22 +3,13 @@ import { hashPassword, verifyPassword, sha256, hashFingerprint } from '../../uti
 import { signTokenPair, signLoginPendingToken, signPortalToken } from '../../utils/jwt';
 import { generateAccountNumber } from '../../utils/accountNumber';
 import { createOtp } from '../../utils/otp';
-import { sendMail, otpEmailHtml, newDeviceAlertHtml } from '../../lib/mailer';
+import { notify } from '../../lib/notifier';
 import { publishEvent } from '../../lib/kafka';
 import { config } from '../../config/env';
 import { LiveRegisterInput, LiveLoginInput } from './live.schema';
 import { AppError } from '../../utils/errors';
 import { logger } from '../../lib/logger';
 
-/**
- * Fire-and-forget email helper — SMTP failures are logged but never thrown.
- * The caller's happy path must never depend on email delivery succeeding.
- */
-function fireEmail(task: Promise<void>, context: Record<string, unknown>): void {
-  task.catch((err: unknown) => {
-    logger.error({ err, ...context }, '[mailer] Email delivery failed — non-fatal');
-  });
-}
 
 // ── Register ──────────────────────────────────────────────────────────────────
 
@@ -29,8 +20,8 @@ export async function registerLiveUser(input: LiveRegisterInput) {
   const tradingPassword     = generateSecurePassword();
   const tradingPasswordHash = await hashPassword(tradingPassword);
 
-  // ── Phone pre-flight check ──────────────────────────────────────────────────
-  // Check before Kafka so user gets an immediate 409 instead of silent drop.
+  // ── Pre-flight checks (Phone & Referral) ────────────────────────────────────
+  // Check before Kafka so user gets an immediate 400/409 instead of silent drop.
   try {
     const phoneResp = await fetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-phone/${encodeURIComponent(input.phoneNumber)}?ownerEmail=${encodeURIComponent(input.email)}`,
@@ -47,6 +38,26 @@ export async function registerLiveUser(input: LiveRegisterInput) {
     logger.warn({ err }, '[register] Phone pre-flight check failed — proceeding');
   }
 
+  // ── Referral Code pre-flight check ──────────────────────────────────────────
+  if (input.referralCode) {
+    try {
+      // NOTE: Using process.env explicitly for this internal fetch like the phone check
+      const refResp = await fetch(
+        `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-referral/${encodeURIComponent(input.referralCode)}`,
+        { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } }
+      );
+      if (refResp.ok) {
+        const { valid } = await refResp.json() as { valid: boolean };
+        if (!valid) {
+          throw new AppError('INVALID_REFERRAL_CODE', 400, 'The referral code you entered is invalid.');
+        }
+      }
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      logger.warn({ err }, '[register] Referral pre-flight check failed — proceeding without referral');
+    }
+  }
+
   // Publish to Kafka — user-service will create the UserProfile + LiveUser
   await publishEvent('user.register', accountNumber, {
     type:               'LIVE_USER_REGISTER',
@@ -60,18 +71,14 @@ export async function registerLiveUser(input: LiveRegisterInput) {
     currency:           input.currency,
     leverage:           input.leverage,
     isSelfTrading:      true,
+    ...(input.referralCode !== undefined && { referredByCode: input.referralCode }),
   });
+
 
   // OTP keyed by accountNumber to support multiple accounts per email
   const otp = await createOtp(accountNumber, 'email_verify');
-  fireEmail(
-    sendMail({
-      to:      input.email,
-      subject: 'Verify your LiveFXHub account',
-      html:    otpEmailHtml(otp, 'email verification', config.otpExpiresInMinutes),
-    }),
-    { email: input.email, accountNumber, purpose: 'email_verify' },
-  );
+  // Fire-and-forget — email verify OTP via notification-service
+  void notify.otp(input.email, otp, 'Email Verification', config.otpExpiresInMinutes);
 
   return {
     accountNumber,
@@ -157,6 +164,17 @@ export async function loginLiveUser(
   // 2. Verify master (web portal) password
   const passwordOk = await verifyPassword(input.password, portal.masterPasswordHash);
   if (!passwordOk) throw new AppError('INVALID_CREDENTIALS', 401);
+
+  // 3. Email must be verified before any token is issued.
+  //    Check AFTER password so we don't leak whether the email exists.
+  //    This matches industry practice (Binance, Exness, Coinbase).
+  if (!portal.isVerified) {
+    throw new AppError(
+      'EMAIL_NOT_VERIFIED',
+      403,
+      'Please verify your email address before logging in. Check your inbox or request a new code.',
+    );
+  }
 
   const activeAccounts = portal.accounts.filter(a => a.isActive);
 
@@ -333,22 +351,11 @@ async function runDeviceCheckAndIssueTokens(
 
     if (!hasTOTP) {
       const otp = await createOtp(accountCtx.userId, 'login');
-      fireEmail(
-        sendMail({
-          to:      email,
-          subject: 'Your LiveFXHub login code',
-          html:    otpEmailHtml(otp, 'login verification', config.otpExpiresInMinutes),
-        }),
-        { userId: accountCtx.userId, purpose: 'login' },
-      );
+      void notify.otp(email, otp, 'Login Verification', config.otpExpiresInMinutes);
     }
 
     if (isNewDevice && config.newDeviceAlert) {
-      sendMail({
-        to:      email,
-        subject: '⚠️ New device login detected — LiveFXHub',
-        html:    newDeviceAlertHtml(input.deviceLabel ?? userAgent, ipAddress, new Date().toISOString()),
-      }).catch(() => void 0);
+      void notify.newDeviceLogin(email, input.deviceLabel ?? userAgent, ipAddress);
     }
 
     return {

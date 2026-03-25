@@ -12,6 +12,9 @@ export interface JwtPayload {
   groupName?: string;
   currency?: string;
   permissions?: string[];
+  // ── GBAC — present in admin tokens only ───────────────────────────────────
+  allCountries?: boolean;   // true = no country filter
+  countryCodes?: string[];  // ISO-2; only present when allCountries=false
 }
 
 export interface TokenPair {
@@ -37,7 +40,7 @@ export function signTokenPair(
   userId: string,
   userType: string,
   accountNumber: string,
-  extras: Partial<Pick<JwtPayload, 'groupName' | 'currency' | 'permissions'>> = {},
+  extras: Partial<Pick<JwtPayload, 'groupName' | 'currency' | 'permissions' | 'allCountries' | 'countryCodes'>> = {},
   existingSessionId?: string,
 ): TokenPair {
   const sessionId = existingSessionId ?? uuidv4();
