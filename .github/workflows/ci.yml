@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, master, develop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, master, develop]
 
 jobs:
   test-and-lint:
@@ -62,7 +62,7 @@ jobs:
   deploy-to-k3s:
     runs-on: ubuntu-latest
     needs: test-and-lint
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     steps:
       - name: Deploy securely over SSH (Direct Build)
         uses: appleboy/ssh-action@master
@@ -71,14 +71,16 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
+            set -e
             # Navigate to where your code is on the server
             cd /v3/auth-service
             
-            # Pull latest code from github directly onto the server
-            git pull origin main
+            # Force server to match GitHub exactly, bypassing any local modifications
+            git fetch origin
+            git reset --hard origin/${{ github.ref_name }}
             
-            # Build the fresh local image natively
-            docker build -t auth-service:local .
+            # Build the fresh local image natively (no-cache to ensure updates)
+            docker build --no-cache -t auth-service:local .
             
             # Since you're using k3s, save and import it directly into the cluster runtime
             docker save auth-service:local | sudo k3s ctr images import -
