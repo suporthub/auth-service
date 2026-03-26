@@ -205,51 +205,32 @@ export async function loginLiveUser(
 
   const activeAccounts = portal.accounts.filter(a => a.isActive);
 
-  // 3. Multi-account check: if user has multiple active live accounts, issue
-  //    a Portal JWT token pair so the frontend can display the dashboard and account picker.
-  if (activeAccounts.length > 1) {
-    const tokens = signPortalTokenPair(portal.profileId);
-    
-    await prismaWrite.session.create({
-      data: {
-        id:          tokens.sessionId,
-        userId:      portal.profileId,
-        userType:    'live', // Treated as a live user session
-        tokenHash:   sha256(tokens.accessJti),
-        refreshHash: sha256(tokens.refreshJti),
-        expiresAt:   tokens.refreshExpiresAt,
-        ipAddress,
-        userAgent,
-      },
-    });
-
-    return {
-      status:             'account_selection_required',
-      portalToken:        tokens.accessToken,
-      portalRefreshToken: tokens.refreshToken,
-      sessionId:          tokens.sessionId,
-      expiresIn:          15 * 60, // 15 mins (default jwtExpiresIn) matches runDeviceCheckAndIssueTokens
-      accounts:           activeAccounts,
-      message:            'Select an account to continue',
-    };
-  }
-
-  // 4. Single account — proceed with device check + session creation
   if (activeAccounts.length === 0) throw new AppError('NO_ACTIVE_ACCOUNTS', 403);
 
-  const accountCtx = await getLiveAccountContext(activeAccounts[0]!.accountNumber);
-  if (!accountCtx) throw new AppError('INVALID_CREDENTIALS', 401);
-
-  return await runDeviceCheckAndIssueTokens(
-    accountCtx,
-    portal.email,
-    {
-      ...(input.deviceFingerprint !== undefined && { deviceFingerprint: input.deviceFingerprint }),
-      ...(input.deviceLabel !== undefined && { deviceLabel: input.deviceLabel }),
+  // 3. Multi-account architecture: Always issue a Portal JWT token pair 
+  //    so the frontend ALWAYS displays the unified Master Dashboard.
+  const tokens = signPortalTokenPair(portal.profileId);
+  
+  await prismaWrite.session.create({
+    data: {
+      id:          tokens.sessionId,
+      userId:      portal.profileId,
+      userType:    'live', // Treated as a live user session in the portal
+      tokenHash:   sha256(tokens.accessJti),
+      refreshHash: sha256(tokens.refreshJti),
+      expiresAt:   tokens.refreshExpiresAt,
+      ipAddress,
+      userAgent,
     },
-    ipAddress,
-    userAgent,
-  );
+  });
+
+  return {
+    status:             'success',
+    portalToken:        tokens.accessToken,
+    portalRefreshToken: tokens.refreshToken,
+    sessionId:          tokens.sessionId,
+    expiresIn:          15 * 60, // 15 mins
+  };
 }
 
 // ── Account selection (after portal login) ────────────────────────────────────

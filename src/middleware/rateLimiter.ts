@@ -4,7 +4,7 @@ import { getRedis } from '../lib/redis';
 interface RateLimitOptions {
   windowSeconds: number;
   max: number;
-  keyFn: (req: Request) => string;
+  keyFn: (req: Request) => string | null | undefined;
   message?: string;
 }
 
@@ -15,8 +15,16 @@ interface RateLimitOptions {
  */
 export function redisRateLimit(opts: RateLimitOptions) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const keySuffix = opts.keyFn(req);
+    
+    // Skip this limiter layer if no key was generated (e.g., missing fingerprint or email)
+    if (!keySuffix) {
+      next();
+      return;
+    }
+
     const redis = getRedis();
-    const key = `rl:${opts.keyFn(req)}`;
+    const key = `rl:${keySuffix}`;
     const now = Date.now();
     const windowStart = now - opts.windowSeconds * 1000;
 
@@ -51,29 +59,102 @@ export function redisRateLimit(opts: RateLimitOptions) {
 
 // ── Pre-configured rate limiters ──────────────────────────────────────────────
 
-export const loginRateLimit = redisRateLimit({
-  windowSeconds: 15 * 60,
-  max: 5,
-  keyFn: (req) => `login:${req.ip}:${String(req.body?.email ?? '')}`,
-  message: 'Too many login attempts. Please wait 15 minutes.',
-});
+export const loginRateLimit = [
+  // Layer 1: IP Limit (Broad)
+  redisRateLimit({
+    windowSeconds: 15 * 60,
+    max: 100, // Reverted to higher development limits
+    keyFn: (req) => `login:ip:${req.ip}`,
+    message: 'Too many login attempts from this network. Please wait 15 minutes.',
+  }),
+  // Layer 2: Device Fingerprint Limit (Strict)
+  redisRateLimit({
+    windowSeconds: 15 * 60,
+    max: 20,
+    keyFn: (req) => {
+      const fp = req.headers['x-device-fingerprint'];
+      return typeof fp === 'string' && fp.trim().length > 0 ? `login:device:${fp}` : null;
+    },
+    message: 'Too many login attempts from this device. Please wait 15 minutes.',
+  }),
+  // Layer 3: Account Identifier Limit (Strictest)
+  redisRateLimit({
+    windowSeconds: 15 * 60,
+    max: 10,
+    keyFn: (req) => {
+      const email = req.body?.email;
+      return typeof email === 'string' && email.trim().length > 0 ? `login:email:${email}` : null;
+    },
+    message: 'Too many login attempts for this account. Please wait 15 minutes.',
+  }),
+];
 
-export const registerRateLimit = redisRateLimit({
-  windowSeconds: 60 * 60,
-  max: 3,
-  keyFn: (req) => `register:${req.ip}`,
-  message: 'Too many registration attempts. Please wait 1 hour.',
-});
+export const registerRateLimit = [
+  // Layer 1: IP Limit
+  redisRateLimit({
+    windowSeconds: 60 * 60,
+    max: 100,
+    keyFn: (req) => `register:ip:${req.ip}`,
+    message: 'Too many registration attempts from this network. Please wait 1 hour.',
+  }),
+  // Layer 2: Device Fingerprint Limit
+  redisRateLimit({
+    windowSeconds: 60 * 60,
+    max: 10,
+    keyFn: (req) => {
+      const fp = req.headers['x-device-fingerprint'];
+      return typeof fp === 'string' && fp.trim().length > 0 ? `register:device:${fp}` : null;
+    },
+    message: 'Too many registration attempts from this device. Please wait 1 hour.',
+  }),
+];
 
-export const otpSendRateLimit = redisRateLimit({
-  windowSeconds: 10 * 60,
-  max: 3,
-  keyFn: (req) => `otp_send:${String(req.body?.email ?? req.body?.phone ?? req.ip)}`,
-  message: 'Too many OTP requests. Please wait 10 minutes.',
-});
+export const otpSendRateLimit = [
+  // Layer 1: IP Limit
+  redisRateLimit({
+    windowSeconds: 10 * 60,
+    max: 100,
+    keyFn: (req) => `otp_send:ip:${req.ip}`,
+    message: 'Too many OTP requests from this network. Please wait 10 minutes.',
+  }),
+  // Layer 2: Device Fingerprint Limit
+  redisRateLimit({
+    windowSeconds: 10 * 60,
+    max: 20,
+    keyFn: (req) => {
+      const fp = req.headers['x-device-fingerprint'];
+      return typeof fp === 'string' && fp.trim().length > 0 ? `otp_send:device:${fp}` : null;
+    },
+    message: 'Too many OTP requests from this device. Please wait 10 minutes.',
+  }),
+  // Layer 3: User Identifier Limit
+  redisRateLimit({
+    windowSeconds: 10 * 60,
+    max: 10,
+    keyFn: (req) => {
+      const id = req.body?.email || req.body?.phone;
+      return typeof id === 'string' && id.trim().length > 0 ? `otp_send:id:${id}` : null;
+    },
+    message: 'Too many OTP requests for this account. Please wait 10 minutes.',
+  }),
+];
 
-export const totpRateLimit = redisRateLimit({
-  windowSeconds: 5 * 60,
-  max: 5,
-  keyFn: (req) => `totp:${req.ip}`,
-});
+export const totpRateLimit = [
+  // Layer 1: IP Limit
+  redisRateLimit({
+    windowSeconds: 5 * 60,
+    max: 100,
+    keyFn: (req) => `totp:ip:${req.ip}`,
+    message: 'Too many TOTP attempts from this network. Please wait 5 minutes.',
+  }),
+  // Layer 2: Device Fingerprint Limit
+  redisRateLimit({
+    windowSeconds: 5 * 60,
+    max: 20,
+    keyFn: (req) => {
+      const fp = req.headers['x-device-fingerprint'];
+      return typeof fp === 'string' && fp.trim().length > 0 ? `totp:device:${fp}` : null;
+    },
+    message: 'Too many TOTP attempts from this device. Please wait 5 minutes.',
+  }),
+];
