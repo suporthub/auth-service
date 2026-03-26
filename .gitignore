@@ -1,7 +1,5 @@
 node_modules/
 dist/
-.env
-*.env.local
 .prisma/
 prisma/migrations/**/migration_lock.toml
 __pycache__/
