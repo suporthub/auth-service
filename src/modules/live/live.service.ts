@@ -41,21 +41,47 @@ export async function registerLiveUser(input: LiveRegisterInput) {
   // ── Referral Code pre-flight check ──────────────────────────────────────────
   if (input.referralCode) {
     try {
-      // NOTE: Using process.env explicitly for this internal fetch like the phone check
       const refResp = await fetch(
         `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-referral/${encodeURIComponent(input.referralCode)}`,
         { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } }
       );
       if (refResp.ok) {
         const { valid } = await refResp.json() as { valid: boolean };
-        if (!valid) {
-          throw new AppError('INVALID_REFERRAL_CODE', 400, 'The referral code you entered is invalid.');
-        }
+        if (!valid) throw new AppError('INVALID_REFERRAL_CODE', 400, 'The referral code you entered is invalid.');
       }
     } catch (err) {
       if (err instanceof AppError) throw err;
       logger.warn({ err }, '[register] Referral pre-flight check failed — proceeding without referral');
     }
+  }
+
+  // ── Email Duplicate Pre-flight Check ────────────────────────────────────────
+  try {
+    const emailResp = await fetch(
+      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+        body:    JSON.stringify({ email: input.email }),
+      }
+    );
+    if (emailResp.ok) {
+      const existingProfile = await emailResp.json() as { isVerified: boolean; accounts?: { accountNumber: string }[] };
+      if (existingProfile.isVerified) {
+        throw new AppError('EMAIL_ALREADY_REGISTERED', 409, 'An account with this email already exists. Please log in.');
+      } else {
+        // Unverified User — proactively re-send OTP against their exact existing account number
+        const existingAccount = existingProfile.accounts?.[0]?.accountNumber;
+        if (existingAccount) {
+          const otp = await createOtp(existingAccount, 'email_verify');
+          void notify.otp(input.email, otp, 'Email Verification', config.otpExpiresInMinutes);
+        }
+        throw new AppError('EMAIL_PENDING_VERIFICATION', 409, 'An unverified account with this email already exists. A new verification code has been sent to your email.');
+      }
+    }
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    logger.warn({ err }, '[register] Email pre-flight check failed — proceeding');
   }
 
   // Publish to Kafka — user-service will create the UserProfile + LiveUser

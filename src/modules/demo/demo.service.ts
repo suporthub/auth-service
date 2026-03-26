@@ -11,6 +11,23 @@ export async function registerDemoUser(input: DemoRegisterInput) {
   const accountNumber = await generateAccountNumber('DU');
   const passwordHash = await hashPassword(input.password);
 
+  // ── Email Duplicate Pre-flight Check ────────────────────────────────────────
+  try {
+    const emailResp = await fetch(
+      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
+        body:    JSON.stringify({ email: input.email }),
+      }
+    );
+    if (emailResp.ok) {
+      throw new AppError('EMAIL_ALREADY_REGISTERED', 409, 'An account with this email already exists. Please log in.');
+    }
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+  }
+
   await publishEvent('user.register', accountNumber, {
     type: 'DEMO_USER_REGISTER',
     accountNumber,
