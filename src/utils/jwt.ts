@@ -88,11 +88,34 @@ export function verifyToken(token: string): JwtPayload {
   }) as JwtPayload;
 }
 
-/** Portal JWT — issued when user has multiple accounts; scoped to profileId only. */
-export function signPortalToken(profileId: string, userType: string): string {
-  return jwt.sign(
-    { sub: profileId, userType, typ: 'portal', jti: uuidv4() } as object,
+/** Portal JWT — issued for the master portal dashboard. Scoped to profileId only. */
+export function signPortalTokenPair(profileId: string): TokenPair {
+  const sessionId = uuidv4();
+  const accessJti = uuidv4();
+  const refreshJti = uuidv4();
+
+  const common = { sub: profileId, sid: sessionId, userType: 'live', accountNumber: '' };
+
+  const access = jwt.sign(
+    { ...common, jti: accessJti, typ: 'portal' } as object,
     config.jwtSecret,
-    { expiresIn: '10m', issuer: 'livefxhub-auth', audience: 'livefxhub-api' } as SignOptions,
+    { expiresIn: config.jwtExpiresIn, issuer: 'livefxhub-auth', audience: 'livefxhub-api' } as SignOptions,
   );
+
+  const refresh = jwt.sign(
+    { ...common, jti: refreshJti, typ: 'refresh' } as object,
+    config.jwtSecret,
+    { expiresIn: config.jwtRefreshExpiresIn, issuer: 'livefxhub-auth', audience: 'livefxhub-api' } as SignOptions,
+  );
+
+  const now = Date.now();
+  return {
+    accessToken: access,
+    refreshToken: refresh,
+    sessionId,
+    accessJti,
+    refreshJti,
+    accessExpiresAt: new Date(now + msFromExpiry(config.jwtExpiresIn)),
+    refreshExpiresAt: new Date(now + msFromExpiry(config.jwtRefreshExpiresIn)),
+  };
 }

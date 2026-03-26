@@ -1,6 +1,6 @@
 import { prismaWrite, prismaRead } from '../../lib/prisma';
 import { hashPassword, verifyPassword, sha256, hashFingerprint } from '../../utils/hash';
-import { signTokenPair, signLoginPendingToken, signPortalToken } from '../../utils/jwt';
+import { signTokenPair, signLoginPendingToken, signPortalTokenPair } from '../../utils/jwt';
 import { generateAccountNumber } from '../../utils/accountNumber';
 import { createOtp } from '../../utils/otp';
 import { notify } from '../../lib/notifier';
@@ -145,8 +145,8 @@ async function getLiveAccountContext(accountNumber: string): Promise<LoginContex
       { headers: { 'x-service-secret': config.internalSecret } },
     );
     if (!resp.ok) return null;
-    const ctx = await resp.json() as LoginContext & { profileId: string };
-    return { ...ctx, userType: 'live' };
+    const ctx = await resp.json() as LoginContext & { profileId: string; userType: 'live' | 'demo' };
+    return ctx;
   } catch {
     return null;
   }
@@ -165,10 +165,11 @@ export async function loginLiveUser(
   const passwordOk = await verifyPassword(input.password, portal.masterPasswordHash);
   if (!passwordOk) throw new AppError('INVALID_CREDENTIALS', 401);
 
-  // 3. Email must be verified before any token is issued.
+  // 3. Email must be verified before any token is issued for Live accounts.
   //    Check AFTER password so we don't leak whether the email exists.
-  //    This matches industry practice (Binance, Exness, Coinbase).
-  if (!portal.isVerified) {
+  //    Demo-only users (who bypass verification initially) are allowed into the Portal.
+  const hasLiveAccounts = portal.accounts.some(a => a.type === 'live');
+  if (!portal.isVerified && hasLiveAccounts) {
     throw new AppError(
       'EMAIL_NOT_VERIFIED',
       403,
@@ -179,14 +180,31 @@ export async function loginLiveUser(
   const activeAccounts = portal.accounts.filter(a => a.isActive);
 
   // 3. Multi-account check: if user has multiple active live accounts, issue
-  //    a Portal JWT so the frontend can show an account picker.
+  //    a Portal JWT token pair so the frontend can display the dashboard and account picker.
   if (activeAccounts.length > 1) {
-    const portalToken = signPortalToken(portal.profileId, 'live');
+    const tokens = signPortalTokenPair(portal.profileId);
+    
+    await prismaWrite.session.create({
+      data: {
+        id:          tokens.sessionId,
+        userId:      portal.profileId,
+        userType:    'live', // Treated as a live user session
+        tokenHash:   sha256(tokens.accessJti),
+        refreshHash: sha256(tokens.refreshJti),
+        expiresAt:   tokens.refreshExpiresAt,
+        ipAddress,
+        userAgent,
+      },
+    });
+
     return {
-      status:       'account_selection_required',
-      portalToken,
-      accounts:     activeAccounts,
-      message:      'Select an account to continue',
+      status:             'account_selection_required',
+      portalToken:        tokens.accessToken,
+      portalRefreshToken: tokens.refreshToken,
+      sessionId:          tokens.sessionId,
+      expiresIn:          15 * 60, // 15 mins (default jwtExpiresIn) matches runDeviceCheckAndIssueTokens
+      accounts:           activeAccounts,
+      message:            'Select an account to continue',
     };
   }
 
@@ -235,6 +253,15 @@ export async function openNewAccount(
   profileId: string,
   options: { groupName: string; currency: string; leverage: number; tradingPassword?: string },
 ) {
+  // Demo users can enter the portal unverified; but creating a live account strictly requires verification.
+  const profileResp = await fetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/${profileId}`,
+    { headers: { 'x-service-secret': config.internalSecret } }
+  );
+  if (!profileResp.ok) throw new AppError('USER_NOT_FOUND', 404);
+  const profile = await profileResp.json() as { isVerified?: boolean };
+  if (!profile.isVerified) throw new AppError('EMAIL_NOT_VERIFIED', 403, 'Email verification required to open a live trading account.');
+
   const accountNumber       = await generateAccountNumber('LU');
   const rawPassword         = options.tradingPassword ?? generateSecurePassword();
   const tradingPasswordHash = await hashPassword(rawPassword);

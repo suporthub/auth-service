@@ -1,5 +1,5 @@
 import { prismaWrite, prismaRead } from '../../lib/prisma';
-import { verifyToken, signTokenPair } from '../../utils/jwt';
+import { verifyToken, signTokenPair, signPortalTokenPair } from '../../utils/jwt';
 import { sha256 } from '../../utils/hash';
 import { AppError } from '../../utils/errors';
 import { UserType } from '@prisma/client';
@@ -33,14 +33,19 @@ export async function refreshSession(refreshToken: string, ipAddress: string, us
   if (payload.currency   !== undefined) extras.currency   = payload.currency;
   if (payload.permissions !== undefined) extras.permissions = payload.permissions;
 
-  const tokens = signTokenPair(
-    payload.sub,
-    payload.userType,
-    payload.accountNumber,
-    extras,
-    // Do NOT pass session.id here — each rotation must get a brand-new session UUID.
-    // Reusing the old ID would violate the PK constraint since the old row still exists (revokedAt is set but row is not deleted).
-  );
+  let tokens;
+  if (payload.userType === 'live' && payload.accountNumber === '') {
+    // It's a Master Portal session refresh
+    tokens = signPortalTokenPair(payload.sub);
+  } else {
+    // It's a Trading session refresh (or demo)
+    tokens = signTokenPair(
+      payload.sub,
+      payload.userType,
+      payload.accountNumber,
+      extras,
+    );
+  }
 
   await prismaWrite.session.create({
     data: {

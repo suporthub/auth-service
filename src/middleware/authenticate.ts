@@ -39,8 +39,8 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     return;
   }
 
-  // Portal tokens don't have a session row — skip DB check
-  if (payload.typ === 'access') {
+  // Both 'access' and 'portal' tokens require an active session row in the DB
+  if (payload.typ === 'access' || payload.typ === 'portal') {
     const tokenHash = sha256(payload.jti);
     const session = await prismaRead.session.findUnique({ where: { tokenHash } });
     if (!session || session.revokedAt !== null || session.expiresAt < new Date()) {
