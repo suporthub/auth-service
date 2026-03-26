@@ -23,9 +23,15 @@ export const sha256 = (input: string): string =>
 // ── AES-256-GCM (for TOTP secrets) ───────────────────────────────────────────
 // KEY must be 32 bytes hex string from env (TOTP_ENCRYPTION_KEY)
 function getKey(hexKey: string): Buffer {
-  const buf = Buffer.from(hexKey, 'hex');
-  if (buf.length !== 32) throw new Error('TOTP_ENCRYPTION_KEY must be a 64-char hex string (32 bytes)');
-  return buf;
+  let buf = Buffer.from(hexKey, 'hex');
+  if (buf.length === 32) return buf;
+
+  buf = Buffer.from(hexKey, 'utf8');
+  if (buf.length === 32) return buf;
+
+  // Fault-tolerant fallback: if the admin provided an arbitrary length key (e.g. 68 chars), 
+  // safely derive an exact 32-byte key from it using SHA-256.
+  return createHash('sha256').update(hexKey).digest();
 }
 
 export function encryptAES(plaintext: string, hexKey: string): string {

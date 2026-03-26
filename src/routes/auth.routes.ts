@@ -4,7 +4,7 @@ import { validate } from '../middleware/validate';
 import { authenticate, authenticateLoginPending } from '../middleware/authenticate';
 import { otpSendRateLimit, totpRateLimit } from '../middleware/rateLimiter';
 import { sendOtp, setupTotp, confirmTotp, verifyTotpAtLogin, disableTotp } from '../modules/shared/otp-totp.service';
-import { requestPasswordReset, resetPassword, regenerateViewPassword } from '../modules/shared/password.service';
+import { requestPasswordReset, verifyResetOtp, resetPassword, regenerateViewPassword } from '../modules/shared/password.service';
 import {
   createHmacApiKey,
   createSelfGeneratedApiKey,
@@ -243,12 +243,31 @@ router.delete('/totp', authenticate, async (req: Request, res: Response) => {
 // Password
 // ─────────────────────────────────────────────────────────────────────────────
 
-const forgotSchema  = z.object({ email: z.string().email(), userType: z.enum(['live', 'demo']) });
+const forgotSchema  = z.object({ email: z.string().email() });
+const verifyResetSchema = z.object({ email: z.string().email(), otp: z.string().length(6) });
 const resetSchema   = z.object({ resetToken: z.string().min(1), newPassword: z.string().min(8) });
 
 router.post('/password/forgot', otpSendRateLimit, validate(forgotSchema), async (req: Request, res: Response) => {
-  await requestPasswordReset(req.body.email, req.body.userType);
+  await requestPasswordReset(req.body.email);
   res.json({ success: true, message: 'If an account exists, a reset code has been sent to your email' });
+});
+
+router.post('/password/verify-otp', otpSendRateLimit, validate(verifyResetSchema), async (req: Request, res: Response) => {
+  const { email, otp } = req.body as { email: string; otp: string };
+  const userResp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+    body: JSON.stringify({ email, userType: 'live' }) // 'live' acts as the Master Profile lookup type
+  });
+  
+  if (!userResp.ok) throw new AppError('USER_NOT_FOUND', 404, 'User account not found.');
+  
+  const user = await userResp.json() as Record<string, any>;
+  const userId = user.userId || user.profileId || user.id;
+  if (!userId) throw new AppError('USER_ID_MISSING', 500, 'Unable to determine user ID.');
+
+  const result = await verifyResetOtp(email, otp, userId);
+  res.json({ success: true, data: result });
 });
 
 router.post('/password/reset', validate(resetSchema), async (req: Request, res: Response) => {

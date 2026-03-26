@@ -8,7 +8,7 @@ import { randomBytes } from 'crypto';
 import { UserType } from '@prisma/client';
 
 /** Step 1: User provides email → OTP sent (combined with auth/otp/send) */
-export async function requestPasswordReset(email: string, _userType: 'live' | 'demo') {
+export async function requestPasswordReset(email: string) {
   // Always respond success (prevents user enumeration)
   const otp = await createOtp(email, 'forgot_password');
   void notify.passwordReset(email, otp, config.otpExpiresInMinutes);
@@ -17,7 +17,6 @@ export async function requestPasswordReset(email: string, _userType: 'live' | 'd
 /** Step 2: User verifies OTP → gets a short-lived reset token */
 export async function verifyResetOtp(
   email: string,
-  _userType: 'live' | 'demo',
   otp: string,
   userId: string,
 ) {
@@ -31,7 +30,7 @@ export async function verifyResetOtp(
   await prismaWrite.passwordResetToken.create({
     data: {
       userId,
-      userType: _userType as UserType,
+      userType: 'live', // Represents the Master Profile context
       tokenHash,
       expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 min
     },
