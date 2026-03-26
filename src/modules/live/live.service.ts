@@ -70,12 +70,10 @@ export async function registerLiveUser(input: LiveRegisterInput) {
       if (existingProfile.isVerified) {
         throw new AppError('EMAIL_ALREADY_REGISTERED', 409, 'An account with this email already exists. Please log in.');
       } else {
-        // Unverified User — proactively re-send OTP against their exact existing account number
-        const existingAccount = existingProfile.accounts?.[0]?.accountNumber;
-        if (existingAccount) {
-          const otp = await createOtp(existingAccount, 'email_verify');
-          void notify.otp(input.email, otp, 'Email Verification', config.otpExpiresInMinutes);
-        }
+        // Unverified User — proactively re-send OTP against their master email
+        const otp = await createOtp(input.email, 'email_verify');
+        void notify.otp(input.email, otp, 'Email Verification', config.otpExpiresInMinutes);
+        
         throw new AppError('EMAIL_PENDING_VERIFICATION', 409, 'An unverified account with this email already exists. A new verification code has been sent to your email.');
       }
     }
@@ -101,8 +99,8 @@ export async function registerLiveUser(input: LiveRegisterInput) {
   });
 
 
-  // OTP keyed by accountNumber to support multiple accounts per email
-  const otp = await createOtp(accountNumber, 'email_verify');
+  // Master Portal OTP keyed directly to the master email
+  const otp = await createOtp(input.email, 'email_verify');
   // Fire-and-forget — email verify OTP via notification-service
   void notify.otp(input.email, otp, 'Email Verification', config.otpExpiresInMinutes);
 

@@ -5,7 +5,7 @@ import { notify } from '../../lib/notifier';
 import { createOtp, verifyOtpCode } from '../../utils/otp';
 import { config } from '../../config/env';
 import { randomBytes } from 'crypto';
-import { UserType } from '@prisma/client';
+
 
 /** Step 1: User provides email → OTP sent (combined with auth/otp/send) */
 export async function requestPasswordReset(email: string) {

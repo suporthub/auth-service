@@ -33,38 +33,34 @@ const router = Router();
 const sendOtpSchema = z.object({
   email:         z.string().email(),
   purpose:       z.enum(['email_verify', 'forgot_password', 'withdrawal_confirm', 'twofa_setup']),
-  // Required when purpose === 'email_verify' — used to key the OTP per-account
-  accountNumber: z.string().optional(),
 });
 
 // POST /api/auth/otp/send
 router.post('/otp/send', otpSendRateLimit, validate(sendOtpSchema), async (req: Request, res: Response) => {
-  const { email, purpose, accountNumber } = req.body as { email: string; purpose: string; accountNumber?: string };
+  const { email, purpose } = req.body as { email: string; purpose: string };
 
-  // ── email_verify: keyed by accountNumber (not email) ──────────────────────
-  // OTPs for this purpose are keyed by accountNumber so multiple accounts per
-  // email are correctly distinguished. The caller must always provide accountNumber.
   if (purpose === 'email_verify') {
-    if (!accountNumber) {
-      throw new AppError('ACCOUNT_NUMBER_REQUIRED', 400, 'accountNumber is required when purpose is email_verify.');
-    }
     // Guard: skip if already verified (fail-open if user-service unreachable)
     try {
       const userResp = await fetch(
-        `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
-        { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+        `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
+        { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+          body: JSON.stringify({ email, userType: 'live' })
+        }
       );
       if (userResp.ok) {
         const user = await userResp.json() as { isVerified?: boolean };
         if (user.isVerified) {
-          res.status(400).json({ success: false, code: 'EMAIL_ALREADY_VERIFIED', message: 'This account has already been verified.' });
+          res.status(409).json({ success: false, code: 'EMAIL_ALREADY_VERIFIED', message: 'This account has already been verified. Redirecting to login.' });
           return;
         }
       }
-    } catch { /* user-service unreachable — proceed */ }
+    } catch { /* proceed */ }
 
-    // Generate OTP keyed by accountNumber, then fire email non-fatally
-    const otp = await createOtp(accountNumber, 'email_verify');
+    // Generate OTP keyed by email
+    const otp = await createOtp(email, 'email_verify');
     void notify.otp(email, otp, 'Email Verification', config.otpExpiresInMinutes);
 
     res.json({ success: true, message: `Verification code sent to ${email}` });
@@ -106,53 +102,46 @@ router.post('/otp/verify', authenticateLoginPending, async (req: Request, res: R
 // ─────────────────────────────────────────────────────────────────────────────
 
 const verifyEmailSchema = z.object({
-  accountNumber: z.string().min(1),
-  otp:           z.string().length(6),
+  email: z.string().email(),
+  otp:   z.string().length(6),
 });
 
 /**
  * POST /api/auth/verify-email
  *
- * Step-2 of the registration flow. The user submits the 6-digit OTP that was
- * emailed on registration (or re-sent via POST /api/auth/otp/send).
- *
- * Flow:
- *   1. Look up the live user by accountNumber via user-service internal API.
- *   2. Verify the OTP stored in Redis under `otp:email_verify:<accountNumber>`.
- *   3. If already verified: return 200 ALREADY_VERIFIED (idempotent).
- *   4. PATCH user-service to mark isVerified = true.
- *   5. Return 200 — frontend can now redirect to the login page.
- *
- * Why accountNumber (not email)? The system allows multiple accounts per email.
- * Keying the OTP by accountNumber ensures the correct account is verified.
+ * Refactored for Master Portal: Registration verifies the user's master email directly
+ * instead of tying verification to a specific sub-account.
  */
 router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, res: Response) => {
-  const { accountNumber, otp } = req.body as { accountNumber: string; otp: string };
+  const { email, otp } = req.body as { email: string; otp: string };
 
-  // 1. Resolve user by accountNumber
+  // 1. Resolve master profile by email
   const userResp = await fetch(
-    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
-    { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
+    { 
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
+      body: JSON.stringify({ email, userType: 'live' })
+    }
   );
 
   if (!userResp.ok) {
     if (userResp.status === 403) {
       throw new AppError('INTERNAL_SERVICE_UNAUTHORIZED', 500, 'Internal service authentication failed');
     }
-    // 404 — account not yet created by Kafka consumer; tell user to retry shortly
     throw new AppError('ACCOUNT_NOT_FOUND', 404, 'Account not found. If you just registered, please wait a moment and try again.');
   }
 
-  const user = await userResp.json() as { userId: string; isVerified?: boolean };
+  const user = await userResp.json() as { profileId: string; isVerified?: boolean };
 
-  // 2. Already verified — idempotent short-circuit
+  // 2. Already verified — return 409 Conflict so the frontend reliably redirects to login
   if (user.isVerified) {
-    res.json({ success: true, code: 'ALREADY_VERIFIED', message: 'Your email is already verified. You can log in.' });
+    res.status(409).json({ success: false, code: 'ALREADY_VERIFIED', message: 'Your email is already verified. You can log in.' });
     return;
   }
 
-  // 3. Verify OTP — keyed by accountNumber (set by registerLiveUser)
-  const result = await verifyOtpCode(accountNumber, 'email_verify', otp);
+  // 3. Verify OTP — logically keyed by email
+  const result = await verifyOtpCode(email, 'email_verify', otp);
   if (!result.success) {
     const codeMap: Record<string, number> = {
       EXPIRED_OR_NOT_FOUND: 400,
@@ -162,9 +151,9 @@ router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, r
     throw new AppError(result.reason ?? 'INVALID_OTP', codeMap[result.reason ?? ''] ?? 400);
   }
 
-  // 4. Mark email as verified in user-service
+  // 4. Mark master profile as verified in user-service 
   const patchResp = await fetch(
-    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${user.userId}/verify-email`,
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/${user.profileId}/verify-email`,
     { method: 'PATCH', headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
   );
   if (!patchResp.ok) throw new AppError('EMAIL_VERIFY_PATCH_FAILED', 502);
@@ -262,7 +251,7 @@ router.post('/password/verify-otp', otpSendRateLimit, validate(verifyResetSchema
   
   if (!userResp.ok) throw new AppError('USER_NOT_FOUND', 404, 'User account not found.');
   
-  const user = await userResp.json() as Record<string, any>;
+  const user = await userResp.json() as { id?: string; userId?: string; profileId?: string };
   const userId = user.userId || user.profileId || user.id;
   if (!userId) throw new AppError('USER_ID_MISSING', 500, 'Unable to determine user ID.');
 
