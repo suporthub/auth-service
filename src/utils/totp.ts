@@ -9,7 +9,7 @@ export interface TotpSetup {
 
 export function generateTotpSetup(accountLabel: string): TotpSetup {
   const secret = speakeasy.generateSecret({
-    name: `LiveFXHub (${accountLabel})`,
+    name: 'LiveFXHub',
     length: 20,
   });
   const secretEnc = encryptAES(secret.base32!, config.totpEncryptionKey);
