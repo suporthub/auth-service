@@ -1,3 +1,4 @@
+import { safeFetch } from '../../utils/fetch';
 import { prismaWrite, prismaRead } from '../../lib/prisma';
 import { hashPassword, verifyPassword, sha256, hashFingerprint } from '../../utils/hash';
 import { signTokenPair, signLoginPendingToken, signPortalTokenPair } from '../../utils/jwt';
@@ -23,7 +24,7 @@ export async function registerLiveUser(input: LiveRegisterInput) {
   // ── Pre-flight checks (Phone & Referral) ────────────────────────────────────
   // Check before Kafka so user gets an immediate 400/409 instead of silent drop.
   try {
-    const phoneResp = await fetch(
+    const phoneResp = await safeFetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-phone/${encodeURIComponent(input.phoneNumber)}?ownerEmail=${encodeURIComponent(input.email)}`,
       { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
     );
@@ -41,7 +42,7 @@ export async function registerLiveUser(input: LiveRegisterInput) {
   // ── Referral Code pre-flight check ──────────────────────────────────────────
   if (input.referralCode) {
     try {
-      const refResp = await fetch(
+      const refResp = await safeFetch(
         `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/check-referral/${encodeURIComponent(input.referralCode)}`,
         { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } }
       );
@@ -57,7 +58,7 @@ export async function registerLiveUser(input: LiveRegisterInput) {
 
   // ── Email Duplicate Pre-flight Check ────────────────────────────────────────
   try {
-    const emailResp = await fetch(
+    const emailResp = await safeFetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
       {
         method: 'POST',
@@ -147,7 +148,7 @@ export interface LoginContext {
 
 async function getPortalContext(email: string): Promise<PortalContext | null> {
   try {
-    const resp = await fetch(
+    const resp = await safeFetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
       {
         method: 'POST',
@@ -164,7 +165,7 @@ async function getPortalContext(email: string): Promise<PortalContext | null> {
 
 async function getLiveAccountContext(accountNumber: string): Promise<LoginContext | null> {
   try {
-    const resp = await fetch(
+    const resp = await safeFetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
       { headers: { 'x-service-secret': config.internalSecret } },
     );
@@ -181,12 +182,15 @@ export async function loginLiveUser(
   ipAddress: string,
   userAgent: string,
 ) {
+  const t0 = performance.now();
   // 1. Fetch the UserProfile (not the trading account — master password lives here)
   const portal = await getPortalContext(input.email);
+  const t1 = performance.now();
   if (!portal) throw new AppError('INVALID_CREDENTIALS', 401);
 
   // 2. Verify master (web portal) password
   const passwordOk = await verifyPassword(input.password, portal.masterPasswordHash);
+  const t2 = performance.now();
   if (!passwordOk) {
     void publishEvent('user.journal.events', portal.profileId, {
       eventType: 'FAILED_LOGIN_ATTEMPT',
@@ -217,7 +221,8 @@ export async function loginLiveUser(
   // 3. Multi-account architecture: Always issue a Portal JWT token pair 
   //    so the frontend ALWAYS displays the unified Master Dashboard.
   const tokens = signPortalTokenPair(portal.profileId);
-
+  
+  const t3 = performance.now();
   await prismaWrite.session.create({
     data: {
       id: tokens.sessionId,
@@ -230,6 +235,16 @@ export async function loginLiveUser(
       userAgent,
     },
   });
+  const t4 = performance.now();
+
+  console.info('\n=============================================');
+  console.info('⚡ LOGIN PERFORMANCE TRACE (LATENCY)');
+  console.info(`1. user-service fetch:  ${(t1 - t0).toFixed(2)}ms`);
+  console.info(`2. Bcrypt hash verification: ${(t2 - t1).toFixed(2)}ms`);
+  console.info(`3. Business Logic processing: ${(t3 - t2).toFixed(2)}ms`);
+  console.info(`4. Session creation (DB Write): ${(t4 - t3).toFixed(2)}ms`);
+  console.info(`--- Total Backend Execution: ${(t4 - t0).toFixed(2)}ms`);
+  console.info('=============================================\n');
 
   return {
     status: 'success',
@@ -268,7 +283,7 @@ export async function openNewAccount(
   options: { groupName: string; currency: string; leverage: number; tradingPassword?: string },
 ) {
   // Demo users can enter the portal unverified; but creating a live account strictly requires verification.
-  const profileResp = await fetch(
+  const profileResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/${profileId}`,
     { headers: { 'x-service-secret': config.internalSecret } }
   );
@@ -281,7 +296,7 @@ export async function openNewAccount(
   const tradingPasswordHash = await hashPassword(rawPassword);
   const showPassword = !options.tradingPassword; // show if auto-generated
 
-  await fetch(
+  await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/accounts`,
     {
       method: 'POST',

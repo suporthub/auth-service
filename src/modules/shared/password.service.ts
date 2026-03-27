@@ -1,3 +1,4 @@
+import { safeFetch } from '../../utils/fetch';
 import { prismaWrite, prismaRead } from '../../lib/prisma';
 import { hashPassword, sha256 } from '../../utils/hash';
 import { AppError } from '../../utils/errors';
@@ -55,7 +56,7 @@ export async function resetPassword(
   const passwordHash = await hashPassword(newPassword);
 
   // Tell user-service to update the password
-  await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${record.userId}/password`, {
+  await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${record.userId}/password`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
     body: JSON.stringify({ passwordHash, userType: record.userType }),
@@ -86,7 +87,7 @@ export async function resetPassword(
 export async function regenerateViewPassword(userId: string, userType: string) {
   const viewPassword = randomBytes(6).toString('base64').slice(0, 8).toUpperCase();
 
-  await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${userId}/view-password`, {
+  await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${userId}/view-password`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
     body: JSON.stringify({ viewPassword, userType }),

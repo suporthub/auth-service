@@ -7,7 +7,7 @@ export interface TotpSetup {
   otpauthUrl: string;
 }
 
-export function generateTotpSetup(accountLabel: string): TotpSetup {
+export function generateTotpSetup(): TotpSetup {
   const secret = speakeasy.generateSecret({
     name: 'LiveFXHub',
     length: 20,

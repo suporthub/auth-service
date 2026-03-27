@@ -1,3 +1,4 @@
+import { safeFetch } from '../../utils/fetch';
 import { prismaWrite } from '../../lib/prisma';
 import { hashPassword, verifyPassword, sha256 } from '../../utils/hash';
 import { signTokenPair } from '../../utils/jwt';
@@ -13,7 +14,7 @@ export async function registerDemoUser(input: DemoRegisterInput) {
 
   // ── Email Duplicate Pre-flight Check ────────────────────────────────────────
   try {
-    const emailResp = await fetch(
+    const emailResp = await safeFetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
       {
         method:  'POST',
@@ -50,7 +51,7 @@ export async function loginDemoUser(
   userAgent: string,
 ) {
   // Fetch demo user from user-service
-  const resp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
+  const resp = await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
     body: JSON.stringify({ email: input.email, userType: 'demo' }),

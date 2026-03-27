@@ -1,3 +1,4 @@
+import { safeFetch } from '../../utils/fetch';
 import { prismaWrite } from '../../lib/prisma';
 import { verifyPassword, sha256 } from '../../utils/hash';
 import { signTokenPair } from '../../utils/jwt';
@@ -12,7 +13,7 @@ import { UserType } from '@prisma/client';
 
 // ── Step 1: password verify → OTP or TOTP path ───────────────────────────────
 export async function adminLoginStep1(email: string, password: string) {
-  const resp = await fetch(`${process.env.ADMIN_SERVICE_INTERNAL_URL}/internal/admins/by-email`, {
+  const resp = await safeFetch(`${process.env.ADMIN_SERVICE_INTERNAL_URL}/internal/admins/by-email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
     body: JSON.stringify({ email }),
@@ -75,7 +76,7 @@ export async function adminLoginStep2(
   }
 
   // Fetch admin permissions
-  const permResp = await fetch(`${process.env.ADMIN_SERVICE_INTERNAL_URL}/internal/admins/${adminId}/permissions`, {
+  const permResp = await safeFetch(`${process.env.ADMIN_SERVICE_INTERNAL_URL}/internal/admins/${adminId}/permissions`, {
     headers: { 'x-service-secret': config.internalSecret },
   });
   const permCtx = await permResp.json() as {

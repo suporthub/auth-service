@@ -17,7 +17,7 @@ export async function sendOtp(
 }
 
 // ── TOTP setup ────────────────────────────────────────────────────────────────
-export async function setupTotp(userId: string, userType: string, email: string) {
+export async function setupTotp(userId: string, userType: string) {
   const existing = await prismaRead.userTotpSecret.findUnique({
     where: { userId_userType: { userId, userType: userType as UserType } },
   });
@@ -26,7 +26,7 @@ export async function setupTotp(userId: string, userType: string, email: string)
     throw new AppError('TOTP_ALREADY_SETUP', 400, 'Two-factor authentication is already currently enabled for this account. You must disable it before setting it up again.');
   }
 
-  const { secretEnc, otpauthUrl } = generateTotpSetup(email);
+  const { secretEnc, otpauthUrl } = generateTotpSetup();
 
   // Save unverified TOTP secret (overwrites any previous unverified setup)
   await prismaWrite.userTotpSecret.upsert({

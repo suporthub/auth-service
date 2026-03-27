@@ -1,3 +1,4 @@
+import { safeFetch } from '../utils/fetch';
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate';
@@ -42,7 +43,7 @@ router.post('/otp/send', otpSendRateLimit, validate(sendOtpSchema), async (req: 
   if (purpose === 'email_verify') {
     // Guard: skip if already verified (fail-open if user-service unreachable)
     try {
-      const userResp = await fetch(
+      const userResp = await safeFetch(
         `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
         { 
           method: 'POST',
@@ -82,7 +83,7 @@ router.post('/otp/verify', authenticateLoginPending, async (req: Request, res: R
   const result = await verifyOtpCode(req.user!.sub, 'login', otp);
   if (!result.success) throw new AppError(result.reason ?? 'INVALID_OTP', 400);
 
-  const userResp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
+  const userResp = await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
     headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
   });
   const ctx = await userResp.json() as {
@@ -116,7 +117,7 @@ router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, r
   const { email, otp } = req.body as { email: string; otp: string };
 
   // 1. Resolve master profile by email
-  const userResp = await fetch(
+  const userResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
     { 
       method: 'POST',
@@ -152,7 +153,7 @@ router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, r
   }
 
   // 4. Mark master profile as verified in user-service 
-  const patchResp = await fetch(
+  const patchResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/${user.profileId}/verify-email`,
     { method: 'PATCH', headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
   );
@@ -165,26 +166,9 @@ router.post('/verify-email', validate(verifyEmailSchema), async (req: Request, r
 
 // POST /api/auth/totp/setup  [auth required]
 router.post('/totp/setup', authenticate, totpRateLimit, async (req: Request, res: Response) => {
-  const { sub: userId, userType, accountNumber } = req.user!;
+  const { sub: userId, userType } = req.user!;
 
-  // Best-effort: fetch the user's email from user-service so the authenticator app
-  // shows "LiveFXHub:<email>" as the account label in the QR code.
-  // If user-service is unreachable, fall back to accountNumber — TOTP still works correctly.
-  let totpLabel = accountNumber;
-  try {
-    const userResp = await fetch(
-      `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${userId}?userType=${userType}`,
-      { headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! } },
-    );
-    if (userResp.ok) {
-      const userCtx = await userResp.json() as { email?: string };
-      if (userCtx.email) totpLabel = userCtx.email;
-    }
-  } catch {
-    // user-service unreachable — use accountNumber as fallback label, proceed normally
-  }
-
-  const result = await setupTotp(userId, userType, totpLabel);
+  const result = await setupTotp(userId, userType);
   res.json({ success: true, data: result });
 });
 
@@ -205,7 +189,7 @@ router.post('/totp/verify', authenticateLoginPending, totpRateLimit, async (req:
 
   await verifyTotpAtLogin(req.user!.sub, req.user!.userType, code);
 
-  const userResp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
+  const userResp = await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
     headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
   });
   const ctx = await userResp.json() as {
@@ -243,7 +227,7 @@ router.post('/password/forgot', otpSendRateLimit, validate(forgotSchema), async 
 
 router.post('/password/verify-otp', otpSendRateLimit, validate(verifyResetSchema), async (req: Request, res: Response) => {
   const { email, otp } = req.body as { email: string; otp: string };
-  const userResp = await fetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
+  const userResp = await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
     body: JSON.stringify({ email, userType: 'live' }) // 'live' acts as the Master Profile lookup type

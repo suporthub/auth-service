@@ -3,6 +3,7 @@ import { registerLiveUser, loginLiveUser, selectAccount, openNewAccount } from '
 import { liveRegisterSchema, liveLoginSchema, selectAccountSchema, openNewAccountSchema } from './live.schema';
 import { AppError } from '../../utils/errors';
 import { config } from '../../config/env';
+import { safeFetch } from '../../utils/fetch';
 
 export async function registerController(req: Request, res: Response): Promise<void> {
   const input = liveRegisterSchema.parse(req.body);
@@ -21,7 +22,7 @@ export async function loginController(req: Request, res: Response): Promise<void
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function resolveProfileId(token: any): Promise<string> {
   if (token.typ === 'portal') return token.sub;
-  const userResp = await fetch(
+  const userResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${token.sub}?userType=${token.userType}`,
     { headers: { 'x-service-secret': config.internalSecret } }
   );
@@ -33,7 +34,7 @@ async function resolveProfileId(token: any): Promise<string> {
 
 export async function getMeController(req: Request, res: Response): Promise<void> {
   const profileId = await resolveProfileId(req.user!);
-  const meResp = await fetch(
+  const meResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/me/${profileId}`, 
     { headers: { 'x-service-secret': config.internalSecret } }
   );
@@ -44,7 +45,7 @@ export async function getMeController(req: Request, res: Response): Promise<void
 
 export async function getKycController(req: Request, res: Response): Promise<void> {
   const profileId = await resolveProfileId(req.user!);
-  const kycResp = await fetch(
+  const kycResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/kyc/${profileId}`, 
     { headers: { 'x-service-secret': config.internalSecret } }
   );
@@ -55,7 +56,7 @@ export async function getKycController(req: Request, res: Response): Promise<voi
 
 export async function getAccountsController(req: Request, res: Response): Promise<void> {
   const profileId = await resolveProfileId(req.user!);
-  const accountsResp = await fetch(
+  const accountsResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/accounts/${profileId}`,
     { headers: { 'x-service-secret': config.internalSecret } }
   );
@@ -67,7 +68,7 @@ export async function selectAccountController(req: Request, res: Response): Prom
   const { accountNumber, deviceFingerprint, deviceLabel } = selectAccountSchema.parse(req.body);
   const profileId = req.user!.sub; // Portal JWT carries profileId as sub
 
-  const profileResp = await fetch(
+  const profileResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-account/${encodeURIComponent(accountNumber)}`,
     { headers: { 'x-service-secret': config.internalSecret } }
   );

@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 
-const BCRYPT_ROUNDS = 12;
+const BCRYPT_ROUNDS = 10;
 
 // ── bcrypt ────────────────────────────────────────────────────────────────────
 export const hashPassword = (plain: string): Promise<string> =>
