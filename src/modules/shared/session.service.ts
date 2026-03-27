@@ -61,11 +61,23 @@ export async function refreshSession(refreshToken: string, ipAddress: string, us
     },
   });
 
+  if (payload.userType === 'live' && payload.accountNumber === '') {
+    return {
+      status: 'success',
+      portalToken: tokens.accessToken,
+      portalRefreshToken: tokens.refreshToken,
+      sessionId: tokens.sessionId,
+      expiresIn: 15 * 60,
+    };
+  }
+
   return {
+    status: 'success',
     accessToken: tokens.accessToken,
     refreshToken: tokens.refreshToken,
     expiresIn: 15 * 60,
     tokenType: 'Bearer',
+    sessionId: tokens.sessionId,
   };
 }
 
