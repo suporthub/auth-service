@@ -14,10 +14,10 @@ import { logger } from '../../lib/logger';
 // ── Register ──────────────────────────────────────────────────────────────────
 
 export async function registerLiveUser(input: LiveRegisterInput) {
-  const accountNumber       = await generateAccountNumber('LU');
-  const masterPasswordHash  = await hashPassword(input.password);
+  const accountNumber = await generateAccountNumber('LU');
+  const masterPasswordHash = await hashPassword(input.password);
   // Auto-generate a secure random MT5 trading password (shown once in welcome email)
-  const tradingPassword     = generateSecurePassword();
+  const tradingPassword = generateSecurePassword();
   const tradingPasswordHash = await hashPassword(tradingPassword);
 
   // ── Pre-flight checks (Phone & Referral) ────────────────────────────────────
@@ -60,9 +60,9 @@ export async function registerLiveUser(input: LiveRegisterInput) {
     const emailResp = await fetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
       {
-        method:  'POST',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
-        body:    JSON.stringify({ email: input.email }),
+        body: JSON.stringify({ email: input.email }),
       }
     );
     if (emailResp.ok) {
@@ -73,7 +73,7 @@ export async function registerLiveUser(input: LiveRegisterInput) {
         // Unverified User — proactively re-send OTP against their master email
         const otp = await createOtp(input.email, 'email_verify');
         void notify.otp(input.email, otp, 'Email Verification', config.otpExpiresInMinutes);
-        
+
         throw new AppError('EMAIL_PENDING_VERIFICATION', 409, 'An unverified account with this email already exists. A new verification code has been sent to your email.');
       }
     }
@@ -84,17 +84,17 @@ export async function registerLiveUser(input: LiveRegisterInput) {
 
   // Publish to Kafka — user-service will create the UserProfile + LiveUser
   await publishEvent('user.register', accountNumber, {
-    type:               'LIVE_USER_REGISTER',
+    type: 'LIVE_USER_REGISTER',
     accountNumber,
     masterPasswordHash,
     tradingPasswordHash,
-    email:              input.email,
-    phoneNumber:        input.phoneNumber,
-    country:            input.country,
-    groupName:          input.groupName,
-    currency:           input.currency,
-    leverage:           input.leverage,
-    isSelfTrading:      true,
+    email: input.email,
+    phoneNumber: input.phoneNumber,
+    country: input.country,
+    groupName: input.groupName,
+    currency: input.currency,
+    leverage: input.leverage,
+    isSelfTrading: true,
     ...(input.referralCode !== undefined && { referredByCode: input.referralCode }),
   });
 
@@ -117,17 +117,17 @@ export async function registerLiveUser(input: LiveRegisterInput) {
  * Contains the UserProfile data + list of trading accounts.
  */
 interface PortalContext {
-  profileId:          string;
-  email:              string;
+  profileId: string;
+  email: string;
   masterPasswordHash: string;
-  isVerified:         boolean;
+  isVerified: boolean;
   accounts: Array<{
     accountNumber: string;
-    type:          string;
-    currency:      string;
-    leverage:      number;
-    groupName:     string;
-    isActive:      boolean;
+    type: string;
+    currency: string;
+    leverage: number;
+    groupName: string;
+    isActive: boolean;
   }>;
 }
 
@@ -135,14 +135,14 @@ interface PortalContext {
  * Trading account context used to mint a specific account's Trading JWT.
  */
 export interface LoginContext {
-  userId:        string;
-  profileId?:    string;
-  userType:      'live';
+  userId: string;
+  profileId?: string;
+  userType: 'live';
   accountNumber: string;
-  groupName:     string;
-  currency:      string;
-  passwordHash:  string;
-  isActive:      boolean;
+  groupName: string;
+  currency: string;
+  passwordHash: string;
+  isActive: boolean;
 }
 
 async function getPortalContext(email: string): Promise<PortalContext | null> {
@@ -150,9 +150,9 @@ async function getPortalContext(email: string): Promise<PortalContext | null> {
     const resp = await fetch(
       `${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/by-email`,
       {
-        method:  'POST',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
-        body:    JSON.stringify({ email, userType: 'live' }),
+        body: JSON.stringify({ email, userType: 'live' }),
       },
     );
     if (!resp.ok) return null;
@@ -177,7 +177,7 @@ async function getLiveAccountContext(accountNumber: string): Promise<LoginContex
 }
 
 export async function loginLiveUser(
-  input:     LiveLoginInput,
+  input: LiveLoginInput,
   ipAddress: string,
   userAgent: string,
 ) {
@@ -187,7 +187,16 @@ export async function loginLiveUser(
 
   // 2. Verify master (web portal) password
   const passwordOk = await verifyPassword(input.password, portal.masterPasswordHash);
-  if (!passwordOk) throw new AppError('INVALID_CREDENTIALS', 401);
+  if (!passwordOk) {
+    void publishEvent('user.journal.events', portal.profileId, {
+      eventType: 'FAILED_LOGIN_ATTEMPT',
+      userId: portal.profileId,
+      userType: 'live',
+      ipAddress,
+      reason: 'INVALID_PASSWORD',
+    });
+    throw new AppError('INVALID_CREDENTIALS', 401);
+  }
 
   // 3. Email must be verified before any token is issued for Live accounts.
   //    Check AFTER password so we don't leak whether the email exists.
@@ -208,26 +217,26 @@ export async function loginLiveUser(
   // 3. Multi-account architecture: Always issue a Portal JWT token pair 
   //    so the frontend ALWAYS displays the unified Master Dashboard.
   const tokens = signPortalTokenPair(portal.profileId);
-  
+
   await prismaWrite.session.create({
     data: {
-      id:          tokens.sessionId,
-      userId:      portal.profileId,
-      userType:    'live', // Treated as a live user session in the portal
-      tokenHash:   sha256(tokens.accessJti),
+      id: tokens.sessionId,
+      userId: portal.profileId,
+      userType: 'live', // Treated as a live user session in the portal
+      tokenHash: sha256(tokens.accessJti),
       refreshHash: sha256(tokens.refreshJti),
-      expiresAt:   tokens.refreshExpiresAt,
+      expiresAt: tokens.refreshExpiresAt,
       ipAddress,
       userAgent,
     },
   });
 
   return {
-    status:             'success',
-    portalToken:        tokens.accessToken,
+    status: 'success',
+    portalToken: tokens.accessToken,
     portalRefreshToken: tokens.refreshToken,
-    sessionId:          tokens.sessionId,
-    expiresIn:          15 * 60, // 15 mins
+    sessionId: tokens.sessionId,
+    expiresIn: 15 * 60, // 15 mins
   };
 }
 
@@ -238,12 +247,12 @@ export async function loginLiveUser(
  * Validates the Portal JWT owns the requested account, then issues a Trading JWT.
  */
 export async function selectAccount(
-  profileId:     string,
+  profileId: string,
   accountNumber: string,
-  input:         { deviceFingerprint?: string; deviceLabel?: string },
-  ipAddress:     string,
-  userAgent:     string,
-  email:         string,
+  input: { deviceFingerprint?: string; deviceLabel?: string },
+  ipAddress: string,
+  userAgent: string,
+  email: string,
 ) {
   const accountCtx = await getLiveAccountContext(accountNumber);
   if (!accountCtx) throw new AppError('ACCOUNT_NOT_FOUND', 404);
@@ -267,23 +276,23 @@ export async function openNewAccount(
   const profile = await profileResp.json() as { isVerified?: boolean };
   if (!profile.isVerified) throw new AppError('EMAIL_NOT_VERIFIED', 403, 'Email verification required to open a live trading account.');
 
-  const accountNumber       = await generateAccountNumber('LU');
-  const rawPassword         = options.tradingPassword ?? generateSecurePassword();
+  const accountNumber = await generateAccountNumber('LU');
+  const rawPassword = options.tradingPassword ?? generateSecurePassword();
   const tradingPasswordHash = await hashPassword(rawPassword);
-  const showPassword        = !options.tradingPassword; // show if auto-generated
+  const showPassword = !options.tradingPassword; // show if auto-generated
 
   await fetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/accounts`,
     {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
-      body:    JSON.stringify({
+      body: JSON.stringify({
         profileId,
         accountNumber,
         tradingPasswordHash,
         groupName: options.groupName,
-        currency:  options.currency,
-        leverage:  options.leverage,
+        currency: options.currency,
+        leverage: options.leverage,
       }),
     },
   );
@@ -297,26 +306,26 @@ export async function openNewAccount(
 // ── Issue tokens ──────────────────────────────────────────────────────────────
 
 export async function issueTokensAndCreateSession(
-  ctx:           LoginContext,
+  ctx: LoginContext,
   fingerprintHash: string | null,
-  deviceLabel:   string | null,
-  ipAddress:     string,
-  userAgent:     string,
-  isNewDevice:   boolean,
+  deviceLabel: string | null,
+  ipAddress: string,
+  userAgent: string,
+  isNewDevice: boolean,
 ) {
   const tokens = signTokenPair(ctx.userId, ctx.userType, ctx.accountNumber, {
     groupName: ctx.groupName,
-    currency:  ctx.currency,
+    currency: ctx.currency,
   });
 
   await prismaWrite.session.create({
     data: {
-      id:             tokens.sessionId,
-      userId:         ctx.userId,
-      userType:       'live',
-      tokenHash:      sha256(tokens.accessJti),
-      refreshHash:    sha256(tokens.refreshJti),
-      expiresAt:      tokens.refreshExpiresAt,
+      id: tokens.sessionId,
+      userId: ctx.userId,
+      userType: 'live',
+      tokenHash: sha256(tokens.accessJti),
+      refreshHash: sha256(tokens.refreshJti),
+      expiresAt: tokens.refreshExpiresAt,
       ipAddress,
       userAgent,
       fingerprintHash,
@@ -325,7 +334,7 @@ export async function issueTokensAndCreateSession(
 
   if (fingerprintHash) {
     await prismaWrite.knownDevice.upsert({
-      where:  { userId_userType_fingerprintHash: { userId: ctx.userId, userType: 'live', fingerprintHash } },
+      where: { userId_userType_fingerprintHash: { userId: ctx.userId, userType: 'live', fingerprintHash } },
       create: { userId: ctx.userId, userType: 'live', fingerprintHash, label: deviceLabel },
       update: { lastSeenAt: new Date() },
     });
@@ -333,18 +342,18 @@ export async function issueTokensAndCreateSession(
 
   await publishEvent('user.journal.events', ctx.userId, {
     eventType: isNewDevice ? 'NEW_DEVICE_LOGIN' : 'LOGIN_SUCCESS',
-    userId:    ctx.userId,
-    userType:  'live',
+    userId: ctx.userId,
+    userType: 'live',
     ipAddress,
   });
 
   return {
-    status:       'success',
-    accessToken:  tokens.accessToken,
+    status: 'success',
+    accessToken: tokens.accessToken,
     refreshToken: tokens.refreshToken,
-    expiresIn:    15 * 60,
-    tokenType:    'Bearer',
-    sessionId:    tokens.sessionId,
+    expiresIn: 15 * 60,
+    tokenType: 'Bearer',
+    sessionId: tokens.sessionId,
   };
 }
 
@@ -352,22 +361,22 @@ export async function issueTokensAndCreateSession(
 
 async function runDeviceCheckAndIssueTokens(
   accountCtx: LoginContext,
-  email:      string,
-  input:      { deviceFingerprint?: string; deviceLabel?: string },
-  ipAddress:  string,
-  userAgent:  string,
+  email: string,
+  input: { deviceFingerprint?: string; deviceLabel?: string },
+  ipAddress: string,
+  userAgent: string,
 ) {
   const fingerprintHash = input.deviceFingerprint ? hashFingerprint(input.deviceFingerprint) : null;
   let requires2FA = false;
-  let isNewDevice  = false;
+  let isNewDevice = false;
 
   if (fingerprintHash) {
     const knownDevice = await prismaRead.knownDevice.findUnique({
       where: { userId_userType_fingerprintHash: { userId: accountCtx.userId, userType: 'live', fingerprintHash } },
     });
     if (!knownDevice) {
-      isNewDevice  = true;
-      requires2FA  = true;
+      isNewDevice = true;
+      requires2FA = true;
     } else {
       const daysSinceLastSeen = (Date.now() - knownDevice.lastSeenAt.getTime()) / 86_400_000;
       if (daysSinceLastSeen > config.inactivity2faDays) requires2FA = true;
@@ -378,7 +387,7 @@ async function runDeviceCheckAndIssueTokens(
     const totpRecord = await prismaRead.userTotpSecret.findUnique({
       where: { userId_userType: { userId: accountCtx.userId, userType: 'live' } },
     });
-    const hasTOTP    = totpRecord?.isVerified ?? false;
+    const hasTOTP = totpRecord?.isVerified ?? false;
     const loginToken = signLoginPendingToken(accountCtx.userId, 'live');
 
     if (!hasTOTP) {
@@ -391,9 +400,9 @@ async function runDeviceCheckAndIssueTokens(
     }
 
     return {
-      status:     hasTOTP ? 'totp_required' : 'otp_required',
+      status: hasTOTP ? 'totp_required' : 'otp_required',
       loginToken,
-      message:    hasTOTP ? 'Enter your authenticator code' : 'A verification code has been sent to your email',
+      message: hasTOTP ? 'Enter your authenticator code' : 'A verification code has been sent to your email',
     };
   }
 

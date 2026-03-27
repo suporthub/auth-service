@@ -5,6 +5,7 @@ import { notify } from '../../lib/notifier';
 import { AppError } from '../../utils/errors';
 import { config } from '../../config/env';
 import { UserType } from '@prisma/client';
+import { publishEvent } from '../../lib/kafka';
 
 // ── OTP send (login gate / email verify / withdrawal confirm / etc.) ──────────
 export async function sendOtp(
@@ -53,6 +54,12 @@ export async function confirmTotp(userId: string, userType: string, code: string
     data: { isVerified: true, enabledAt: new Date() },
   });
 
+  await publishEvent('user.journal.events', userId, {
+    eventType: 'TOTP_ENABLED',
+    userId,
+    userType,
+  });
+
   return { message: '2FA has been enabled on your account' };
 }
 
@@ -84,6 +91,12 @@ export async function disableTotp(userId: string, userType: string, code: string
   await prismaWrite.userTotpSecret.update({
     where: { userId_userType: { userId, userType: userType as UserType } },
     data: { isVerified: false, disabledAt: new Date() },
+  });
+
+  await publishEvent('user.journal.events', userId, {
+    eventType: 'TOTP_DISABLED',
+    userId,
+    userType,
   });
 
   return { message: '2FA has been disabled' };

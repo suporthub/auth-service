@@ -5,6 +5,7 @@ import { notify } from '../../lib/notifier';
 import { createOtp, verifyOtpCode } from '../../utils/otp';
 import { config } from '../../config/env';
 import { randomBytes } from 'crypto';
+import { publishEvent } from '../../lib/kafka';
 
 
 /** Step 1: User provides email → OTP sent (combined with auth/otp/send) */
@@ -70,6 +71,12 @@ export async function resetPassword(
   await prismaWrite.session.updateMany({
     where: { userId: record.userId, userType: record.userType, revokedAt: null },
     data: { revokedAt: new Date() },
+  });
+
+  await publishEvent('user.journal.events', record.userId, {
+    eventType: 'PASSWORD_RESET',
+    userId:    record.userId,
+    userType:  record.userType,
   });
 
   return { message: 'Password reset successfully. Please log in with your new password.' };
