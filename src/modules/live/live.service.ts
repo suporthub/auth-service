@@ -7,7 +7,7 @@ import { createOtp } from '../../utils/otp';
 import { notify } from '../../lib/notifier';
 import { publishEvent } from '../../lib/kafka';
 import { config } from '../../config/env';
-import { LiveRegisterInput, LiveLoginInput } from './live.schema';
+import { LiveRegisterInput, LiveLoginInput, OpenLiveAccountInput, OpenDemoAccountInput } from './live.schema';
 import { AppError } from '../../utils/errors';
 import { logger } from '../../lib/logger';
 import { TwoFactorEnforcementPolicy, DeviceContext, SecurityContext } from '../shared/two-factor-policy.service';
@@ -317,13 +317,75 @@ export async function selectAccount(
   );
 }
 
+// ── Account Creation Helper (DRY Principle) ───────────────────────────────────
+
+type AccountCreationConfig = {
+  profileId: string;
+  accountPrefix: 'LU' | 'DU' | 'SP' | 'MAM';
+  options: OpenLiveAccountInput | OpenDemoAccountInput;
+  eventType: string;
+  isDemo?: boolean;
+};
+
+async function createTradingAccountInternal({
+  profileId,
+  accountPrefix,
+  options,
+  eventType,
+  isDemo = false,
+}: AccountCreationConfig) {
+  const accountNumber = await generateAccountNumber(accountPrefix);
+  const rawPassword = options.tradingPassword ?? generateSecurePassword();
+  const tradingPasswordHash = await hashPassword(rawPassword);
+  const showPassword = !options.tradingPassword;
+
+  // Utilize dynamic payload assignment (Open-Closed Principle friendly)
+  const payload: Record<string, unknown> = {
+    profileId,
+    accountNumber,
+    tradingPasswordHash,
+    accountName: options.accountName,
+    groupName: options.group,
+    accountVariant: options.accountVariant,
+    currency: options.currency,
+    leverage: options.leverage,
+  };
+
+  if (isDemo) {
+    payload.isDemo = true;
+    payload.initialBalance = (options as OpenDemoAccountInput).initialBalance;
+  }
+
+  const createResp = await safeFetch(
+    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/accounts`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
+      body: JSON.stringify(payload),
+    },
+  );
+  
+  if (!createResp.ok) throw new AppError('ACCOUNT_CREATION_FAILED', 500);
+
+  await publishEvent('user.journal.events', profileId, {
+    eventType,
+    userId: profileId,
+    userType: 'live',
+  });
+
+  return {
+    accountNumber,
+    ...(showPassword ? { tradingPassword: rawPassword, tradingPasswordNote: 'Save this — it will not be shown again.' } : {}),
+  };
+}
+
 // ── Open new trading account (in-portal) ─────────────────────────────────────
 
-export async function openNewAccount(
+export async function openLiveAccount(
   profileId: string,
-  options: { groupName: string; currency: string; leverage: number; tradingPassword?: string },
+  options: OpenLiveAccountInput,
 ) {
-  // Demo users can enter the portal unverified; but creating a live account strictly requires verification.
+  // Policy Check: Live accounts strictly require verification (Single Responsibility checks)
   const profileResp = await safeFetch(
     `${process.env.USER_SERVICE_INTERNAL_URL}/internal/profiles/${profileId}`,
     { headers: { 'x-service-secret': config.internalSecret } }
@@ -332,31 +394,31 @@ export async function openNewAccount(
   const profile = await profileResp.json() as { isVerified?: boolean };
   if (!profile.isVerified) throw new AppError('EMAIL_NOT_VERIFIED', 403, 'Email verification required to open a live trading account.');
 
-  const accountNumber = await generateAccountNumber('LU');
-  const rawPassword = options.tradingPassword ?? generateSecurePassword();
-  const tradingPasswordHash = await hashPassword(rawPassword);
-  const showPassword = !options.tradingPassword; // show if auto-generated
+  // Orchestrate Creation
+  const result = await createTradingAccountInternal({
+    profileId,
+    accountPrefix: 'LU',
+    options,
+    eventType: 'LIVE_ACCOUNT_CREATED',
+  });
 
-  await safeFetch(
-    `${process.env.USER_SERVICE_INTERNAL_URL}/internal/accounts`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-service-secret': config.internalSecret },
-      body: JSON.stringify({
-        profileId,
-        accountNumber,
-        tradingPasswordHash,
-        groupName: options.groupName,
-        currency: options.currency,
-        leverage: options.leverage,
-      }),
-    },
-  );
+  return { ...result, message: 'Live trading account created successfully' };
+}
 
-  return {
-    accountNumber,
-    ...(showPassword ? { tradingPassword: rawPassword, tradingPasswordNote: 'Save this — it will not be shown again.' } : {}),
-  };
+export async function openDemoAccount(
+  profileId: string,
+  options: OpenDemoAccountInput,
+) {
+  // Orchestrate Creation (No verification policy required)
+  const result = await createTradingAccountInternal({
+    profileId,
+    accountPrefix: 'DU',
+    options,
+    eventType: 'DEMO_ACCOUNT_CREATED',
+    isDemo: true,
+  });
+
+  return { ...result, message: 'Demo trading account created successfully' };
 }
 
 // ── Issue tokens ──────────────────────────────────────────────────────────────

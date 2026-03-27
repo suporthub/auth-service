@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
-import { registerLiveUser, loginLiveUser, selectAccount, openNewAccount } from './live.service';
-import { liveRegisterSchema, liveLoginSchema, selectAccountSchema, openNewAccountSchema } from './live.schema';
+import { registerLiveUser, loginLiveUser, selectAccount, openLiveAccount, openDemoAccount } from './live.service';
+import { liveRegisterSchema, liveLoginSchema, selectAccountSchema, openLiveAccountSchema, openDemoAccountSchema } from './live.schema';
 import { AppError } from '../../utils/errors';
 import { config } from '../../config/env';
 import { safeFetch } from '../../utils/fetch';
@@ -90,10 +90,16 @@ export async function selectAccountController(req: Request, res: Response): Prom
   res.json({ success: true, data: result });
 }
 
-export async function openNewAccountController(req: Request, res: Response): Promise<void> {
+export async function openLiveAccountController(req: Request, res: Response): Promise<void> {
   const profileId = await resolveProfileId(req.user!);
-  const options = openNewAccountSchema.parse(req.body);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await openNewAccount(profileId, options as any);
+  const options = openLiveAccountSchema.parse(req.body);
+  const result = await openLiveAccount(profileId, options);
+  res.status(201).json({ success: true, data: result });
+}
+
+export async function openDemoAccountController(req: Request, res: Response): Promise<void> {
+  const profileId = await resolveProfileId(req.user!);
+  const options = openDemoAccountSchema.parse(req.body);
+  const result = await openDemoAccount(profileId, options);
   res.status(201).json({ success: true, data: result });
 }

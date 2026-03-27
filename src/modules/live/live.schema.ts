@@ -25,14 +25,22 @@ export const liveLoginSchema = z.object({
 
 export type LiveLoginInput = z.infer<typeof liveLoginSchema>;
 
-export const openNewAccountSchema = z.object({
-  groupName:       z.string().default('Standard'),
+export const openLiveAccountSchema = z.object({
+  accountName:     z.string().min(1),
+  group:           z.string().min(1),
+  accountVariant:  z.enum(['cent', 'usd']),
   currency:        z.string().default('USD'),
   leverage:        z.number().int().positive().default(100),
   tradingPassword: z.string().min(8).optional(),
 });
 
-export type OpenNewAccountInput = z.infer<typeof openNewAccountSchema>;
+export type OpenLiveAccountInput = z.infer<typeof openLiveAccountSchema>;
+
+export const openDemoAccountSchema = openLiveAccountSchema.extend({
+  initialBalance:  z.number().int().positive().default(10000),
+});
+
+export type OpenDemoAccountInput = z.infer<typeof openDemoAccountSchema>;
 
 export const selectAccountSchema = z.object({
   accountNumber:     z.string(),

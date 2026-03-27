@@ -6,7 +6,8 @@ import {
   getKycController,
   getAccountsController,
   selectAccountController,
-  openNewAccountController
+  openLiveAccountController,
+  openDemoAccountController
 } from '../modules/live/live.controller';
 import { validate } from '../middleware/validate';
 import { loginRateLimit, registerRateLimit } from '../middleware/rateLimiter';
@@ -14,7 +15,8 @@ import { authenticate, authenticatePortal } from '../middleware/authenticate';
 import {
   liveRegisterSchema,
   liveLoginSchema,
-  openNewAccountSchema,
+  openLiveAccountSchema,
+  openDemoAccountSchema,
 } from '../modules/live/live.schema';
 import { refreshSession, logoutSession, listSessions } from '../modules/shared/session.service';
 import { regenerateViewPassword } from '../modules/shared/password.service';
@@ -93,6 +95,12 @@ router.get('/accounts', authenticate, getAccountsController);
  * POST /api/live/accounts
  * Opens a new live trading account under the current user's verified profile.
  */
-router.post('/accounts', authenticate, validate(openNewAccountSchema), openNewAccountController);
+router.post('/accounts', authenticate, validate(openLiveAccountSchema), openLiveAccountController);
+
+/**
+ * POST /api/live/accounts/demo
+ * Opens a new demo trading account under the current user's profile. Doesn't require KYC.
+ */
+router.post('/accounts/demo', authenticate, validate(openDemoAccountSchema), openDemoAccountController);
 
 export default router;
