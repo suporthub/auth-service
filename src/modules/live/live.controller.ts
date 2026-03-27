@@ -73,7 +73,7 @@ export async function selectAccountController(req: Request, res: Response): Prom
     { headers: { 'x-service-secret': config.internalSecret } }
   );
   if (!profileResp.ok) throw new AppError('ACCOUNT_NOT_FOUND', 404);
-  const accountData = await profileResp.json() as { email?: string; profileId?: string };
+  await profileResp.json(); // exhaust the stream but ignore data since it's unused
 
   const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
   const ua = req.headers['user-agent'] ?? '';
@@ -85,8 +85,7 @@ export async function selectAccountController(req: Request, res: Response): Prom
       ...(deviceFingerprint !== undefined && { deviceFingerprint }),
       ...(deviceLabel !== undefined && { deviceLabel }),
     },
-    ip, ua,
-    accountData.email ?? '',
+    ip, ua
   );
   res.json({ success: true, data: result });
 }

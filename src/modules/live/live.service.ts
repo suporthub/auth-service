@@ -10,7 +10,7 @@ import { config } from '../../config/env';
 import { LiveRegisterInput, LiveLoginInput } from './live.schema';
 import { AppError } from '../../utils/errors';
 import { logger } from '../../lib/logger';
-
+import { TwoFactorEnforcementPolicy, DeviceContext, SecurityContext } from '../shared/two-factor-policy.service';
 
 // ── Register ──────────────────────────────────────────────────────────────────
 
@@ -218,23 +218,62 @@ export async function loginLiveUser(
 
   if (activeAccounts.length === 0) throw new AppError('NO_ACTIVE_ACCOUNTS', 403);
 
-  // 3. Multi-account architecture: Always issue a Portal JWT token pair 
-  //    so the frontend ALWAYS displays the unified Master Dashboard.
-  const tokens = signPortalTokenPair(portal.profileId);
-  
-  const t3 = performance.now();
-  await prismaWrite.session.create({
-    data: {
-      id: tokens.sessionId,
-      userId: portal.profileId,
-      userType: 'live', // Treated as a live user session in the portal
-      tokenHash: sha256(tokens.accessJti),
-      refreshHash: sha256(tokens.refreshJti),
-      expiresAt: tokens.refreshExpiresAt,
-      ipAddress,
-      userAgent,
-    },
+  const fingerprintHash = input.deviceFingerprint ? hashFingerprint(input.deviceFingerprint) : null;
+  const deviceContext: DeviceContext = {
+    isNewDevice: true,
+    daysSinceLastSeen: null,
+  };
+
+  if (fingerprintHash) {
+    const knownDevice = await prismaRead.knownDevice.findUnique({
+      where: { userId_userType_fingerprintHash: { userId: portal.profileId, userType: 'live', fingerprintHash } },
+    });
+    if (knownDevice) {
+      deviceContext.isNewDevice = false;
+      deviceContext.daysSinceLastSeen = (Date.now() - knownDevice.lastSeenAt.getTime()) / 86_400_000;
+    }
+  }
+
+  const totpRecord = await prismaRead.userTotpSecret.findUnique({
+    where: { userId_userType: { userId: portal.profileId, userType: 'live' } },
   });
+  
+  const securityContext: SecurityContext = {
+    hasTOTP: totpRecord?.isVerified ?? false,
+  };
+
+  const policyResult = TwoFactorEnforcementPolicy.evaluate(deviceContext, securityContext);
+
+  if (policyResult.requires2FA) {
+    const loginToken = signLoginPendingToken(portal.profileId, 'live', 'portal');
+
+    if (policyResult.method === 'email') {
+      const otp = await createOtp(portal.profileId, 'login');
+      void notify.otp(portal.email, otp, 'Login Verification', config.otpExpiresInMinutes);
+    }
+
+    if (policyResult.isNewDevice && config.newDeviceAlert) {
+      void notify.newDeviceLogin(portal.email, input.deviceLabel ?? userAgent, ipAddress);
+    }
+
+    return {
+      status: policyResult.method === 'totp' ? 'totp_required' : 'otp_required',
+      loginToken,
+      message: policyResult.method === 'totp' ? 'Enter your authenticator code' : 'A verification code has been sent to your email',
+    };
+  }
+
+  const t3 = performance.now();
+
+  const response = await issuePortalTokensAndCreateSession(
+    portal.profileId,
+    ipAddress,
+    userAgent,
+    fingerprintHash,
+    input.deviceLabel ?? null,
+    policyResult.isNewDevice
+  );
+
   const t4 = performance.now();
 
   console.info('\n=============================================');
@@ -246,13 +285,7 @@ export async function loginLiveUser(
   console.info(`--- Total Backend Execution: ${(t4 - t0).toFixed(2)}ms`);
   console.info('=============================================\n');
 
-  return {
-    status: 'success',
-    portalToken: tokens.accessToken,
-    portalRefreshToken: tokens.refreshToken,
-    sessionId: tokens.sessionId,
-    expiresIn: 15 * 60, // 15 mins
-  };
+  return response;
 }
 
 // ── Account selection (after portal login) ────────────────────────────────────
@@ -267,13 +300,21 @@ export async function selectAccount(
   input: { deviceFingerprint?: string; deviceLabel?: string },
   ipAddress: string,
   userAgent: string,
-  email: string,
 ) {
   const accountCtx = await getLiveAccountContext(accountNumber);
   if (!accountCtx) throw new AppError('ACCOUNT_NOT_FOUND', 404);
   if (accountCtx.profileId !== profileId) throw new AppError('ACCOUNT_FORBIDDEN', 403);
 
-  return await runDeviceCheckAndIssueTokens(accountCtx, email, input, ipAddress, userAgent);
+  const fingerprintHash = input.deviceFingerprint ? hashFingerprint(input.deviceFingerprint) : null;
+
+  return await issueTokensAndCreateSession(
+    accountCtx, 
+    fingerprintHash, 
+    input.deviceLabel ?? null, 
+    ipAddress, 
+    userAgent, 
+    false
+  );
 }
 
 // ── Open new trading account (in-portal) ─────────────────────────────────────
@@ -319,6 +360,54 @@ export async function openNewAccount(
 }
 
 // ── Issue tokens ──────────────────────────────────────────────────────────────
+
+export async function issuePortalTokensAndCreateSession(
+  profileId: string,
+  ipAddress: string,
+  userAgent: string,
+  fingerprintHash: string | null,
+  deviceLabel: string | null,
+  isNewDevice: boolean,
+) {
+  const tokens = signPortalTokenPair(profileId);
+
+  await prismaWrite.session.create({
+    data: {
+      id: tokens.sessionId,
+      userId: profileId,
+      userType: 'live',
+      tokenHash: sha256(tokens.accessJti),
+      refreshHash: sha256(tokens.refreshJti),
+      expiresAt: tokens.refreshExpiresAt,
+      ipAddress,
+      userAgent,
+      fingerprintHash,
+    },
+  });
+
+  if (fingerprintHash) {
+    await prismaWrite.knownDevice.upsert({
+      where: { userId_userType_fingerprintHash: { userId: profileId, userType: 'live', fingerprintHash } },
+      create: { userId: profileId, userType: 'live', fingerprintHash, label: deviceLabel },
+      update: { lastSeenAt: new Date() },
+    });
+  }
+
+  await publishEvent('user.journal.events', profileId, {
+    eventType: isNewDevice ? 'NEW_DEVICE_LOGIN' : 'LOGIN_SUCCESS',
+    userId: profileId,
+    userType: 'live',
+    ipAddress,
+  });
+
+  return {
+    status: 'success',
+    portalToken: tokens.accessToken,
+    portalRefreshToken: tokens.refreshToken,
+    sessionId: tokens.sessionId,
+    expiresIn: 15 * 60, // 15 mins
+  };
+}
 
 export async function issueTokensAndCreateSession(
   ctx: LoginContext,
@@ -373,56 +462,6 @@ export async function issueTokensAndCreateSession(
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
-
-async function runDeviceCheckAndIssueTokens(
-  accountCtx: LoginContext,
-  email: string,
-  input: { deviceFingerprint?: string; deviceLabel?: string },
-  ipAddress: string,
-  userAgent: string,
-) {
-  const fingerprintHash = input.deviceFingerprint ? hashFingerprint(input.deviceFingerprint) : null;
-  let requires2FA = false;
-  let isNewDevice = false;
-
-  if (fingerprintHash) {
-    const knownDevice = await prismaRead.knownDevice.findUnique({
-      where: { userId_userType_fingerprintHash: { userId: accountCtx.userId, userType: 'live', fingerprintHash } },
-    });
-    if (!knownDevice) {
-      isNewDevice = true;
-      requires2FA = true;
-    } else {
-      const daysSinceLastSeen = (Date.now() - knownDevice.lastSeenAt.getTime()) / 86_400_000;
-      if (daysSinceLastSeen > config.inactivity2faDays) requires2FA = true;
-    }
-  }
-
-  if (requires2FA) {
-    const totpRecord = await prismaRead.userTotpSecret.findUnique({
-      where: { userId_userType: { userId: accountCtx.userId, userType: 'live' } },
-    });
-    const hasTOTP = totpRecord?.isVerified ?? false;
-    const loginToken = signLoginPendingToken(accountCtx.userId, 'live');
-
-    if (!hasTOTP) {
-      const otp = await createOtp(accountCtx.userId, 'login');
-      void notify.otp(email, otp, 'Login Verification', config.otpExpiresInMinutes);
-    }
-
-    if (isNewDevice && config.newDeviceAlert) {
-      void notify.newDeviceLogin(email, input.deviceLabel ?? userAgent, ipAddress);
-    }
-
-    return {
-      status: hasTOTP ? 'totp_required' : 'otp_required',
-      loginToken,
-      message: hasTOTP ? 'Enter your authenticator code' : 'A verification code has been sent to your email',
-    };
-  }
-
-  return await issueTokensAndCreateSession(accountCtx, fingerprintHash, input.deviceLabel ?? null, ipAddress, userAgent, isNewDevice);
-}
 
 /** Generate a secure random 12-char alphanumeric + symbol password */
 function generateSecurePassword(): string {

@@ -15,7 +15,7 @@ import {
   addIpToWhitelist,
   removeIpFromWhitelist,
 } from '../modules/shared/apikey.service';
-import { issueTokensAndCreateSession } from '../modules/live/live.service';
+import { issueTokensAndCreateSession, issuePortalTokensAndCreateSession } from '../modules/live/live.service';
 import { verifyOtpCode, createOtp } from '../utils/otp';
 import { verifyTotpCode } from '../utils/totp';
 import { hashFingerprint } from '../utils/hash';
@@ -83,6 +83,19 @@ router.post('/otp/verify', authenticateLoginPending, async (req: Request, res: R
   const result = await verifyOtpCode(req.user!.sub, 'login', otp);
   if (!result.success) throw new AppError(result.reason ?? 'INVALID_OTP', 400);
 
+  const fp = deviceFingerprint ? hashFingerprint(deviceFingerprint) : null;
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
+  const ua = req.headers['user-agent'] ?? '';
+
+  if (req.user!.scope === 'portal') {
+    // 2FA triggered at Master Front Door -> issue Portal Token
+    // We import issuePortalTokensAndCreateSession inline or at the top. Wait, we must ensure it's imported at the top.
+    const tokens = await issuePortalTokensAndCreateSession(req.user!.sub, ip, ua, fp, deviceLabel ?? null, false);
+    res.json({ success: true, data: tokens });
+    return;
+  }
+
+  // 2FA triggered at Trading Account level
   const userResp = await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
     headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
   });
@@ -91,10 +104,7 @@ router.post('/otp/verify', authenticateLoginPending, async (req: Request, res: R
     groupName: string; currency: string; passwordHash: string; isActive: boolean;
   };
 
-  const fp = deviceFingerprint ? hashFingerprint(deviceFingerprint) : null;
-  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
-  const ua = req.headers['user-agent'] ?? '';
-  const tokens = await issueTokensAndCreateSession(ctx, fp, deviceLabel ?? null, ip, ua, !!fp);
+  const tokens = await issueTokensAndCreateSession(ctx, fp, deviceLabel ?? null, ip, ua, false);
   res.json({ success: true, data: tokens });
 });
 
@@ -189,6 +199,16 @@ router.post('/totp/verify', authenticateLoginPending, totpRateLimit, async (req:
 
   await verifyTotpAtLogin(req.user!.sub, req.user!.userType, code);
 
+  const fp = deviceFingerprint ? hashFingerprint(deviceFingerprint) : null;
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
+  const ua = req.headers['user-agent'] ?? '';
+
+  if (req.user!.scope === 'portal') {
+    const tokens = await issuePortalTokensAndCreateSession(req.user!.sub, ip, ua, fp, deviceLabel ?? null, false);
+    res.json({ success: true, data: tokens });
+    return;
+  }
+
   const userResp = await safeFetch(`${process.env.USER_SERVICE_INTERNAL_URL}/internal/users/${req.user!.sub}`, {
     headers: { 'x-service-secret': process.env.INTERNAL_SERVICE_SECRET! },
   });
@@ -197,9 +217,6 @@ router.post('/totp/verify', authenticateLoginPending, totpRateLimit, async (req:
     groupName: string; currency: string; passwordHash: string; isActive: boolean;
   };
 
-  const fp = deviceFingerprint ? hashFingerprint(deviceFingerprint) : null;
-  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? '';
-  const ua = req.headers['user-agent'] ?? '';
   const tokens = await issueTokensAndCreateSession(ctx, fp, deviceLabel ?? null, ip, ua, false);
   res.json({ success: true, data: tokens });
 });

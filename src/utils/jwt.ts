@@ -9,6 +9,7 @@ export interface JwtPayload {
   typ: 'access' | 'refresh' | 'login_pending' | 'portal';
   userType: string;
   accountNumber: string;
+  scope?: 'portal' | 'trading'; // Optional token scope definition
   groupName?: string;
   currency?: string;
   permissions?: string[];
@@ -73,9 +74,9 @@ export function signTokenPair(
   };
 }
 
-export function signLoginPendingToken(userId: string, userType: string): string {
+export function signLoginPendingToken(userId: string, userType: string, scope: 'portal' | 'trading' = 'trading'): string {
   return jwt.sign(
-    { sub: userId, userType, typ: 'login_pending', jti: uuidv4() } as object,
+    { sub: userId, userType, scope, typ: 'login_pending', jti: uuidv4() } as object,
     config.jwtSecret,
     { expiresIn: '5m', issuer: 'livefxhub-auth', audience: 'livefxhub-api' } as SignOptions,
   );
